@@ -2,7 +2,18 @@ import { CONFIG, SETTABLE_SPECS, setConfigValue, toggleConfigValue, type Settabl
 import logger from "./logger.js";
 import { getPositions, forceClosePosition, getStats, getClosedTrades, type ClosedTrade } from "./positionManager.js";
 import { getWalletSolBalance, getWalletAddress } from "./jupClient.js";
-import { isPaused, setPaused, addToBlacklist, removeFromBlacklist, getBlacklist } from "./scgPoller.js";
+import {
+  isPaused,
+  setPaused,
+  addToBlacklist,
+  removeFromBlacklist,
+  getBlacklist,
+  getPollerHealth,
+  hasSeenAlert,
+  alertKey,
+  SCG_URL,
+} from "./scgPoller.js";
+import type { ScgAlertsResponse } from "./types.js";
 import { getPositionSnapshot } from "./okxClient.js";
 import { escapeHtml } from "./notifier.js";
 import { runBacktest } from "./_backtest.js";
@@ -374,6 +385,114 @@ async function handleResume(chatId: number): Promise<void> {
   setPaused(false);
   logger.info("[telegram] bot resumed via /resume");
   await tgPost("sendMessage", { chat_id: chatId, text: "▶️ <b>Resumed</b> — taking new alerts again.", parse_mode: "HTML" });
+}
+
+// ---------------------------------------------------------------------------
+// /ping — end-to-end connectivity check. Runs three independent checks so a
+// user stuck with "I'm not getting signals" can see exactly which stage is
+// broken: (1) can the bot reach the upstream alerts API, (2) is the poller
+// actually processing what it receives (newest upstream alert present in the
+// dedup set), and (3) can the bot deliver a message back to Telegram (the
+// reply itself proves this). Each check reports its own pass/fail + error.
+// ---------------------------------------------------------------------------
+function formatAgo(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return "never";
+  if (ms < 1_000) return `${ms}ms ago`;
+  if (ms < 60_000) return `${Math.round(ms / 1000)}s ago`;
+  if (ms < 3_600_000) return `${Math.round(ms / 60_000)}m ago`;
+  return `${Math.round(ms / 3_600_000)}h ago`;
+}
+
+async function handlePing(chatId: number): Promise<void> {
+  const lines: string[] = ["🩺 <b>Connectivity check</b>"];
+
+  // Check 1 — upstream reachability. Fresh fetch, timed, with its own error
+  // surface. This isolates network/DNS/TLS/auth from the running poller.
+  const t0 = Date.now();
+  let upstreamOk = false;
+  let newestKey: string | null = null;
+  let newestName: string | null = null;
+  let newestAgeMins: number | null = null;
+  let upstreamAlertCount = 0;
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10_000);
+    const res = await fetch(SCG_URL, { signal: controller.signal });
+    clearTimeout(timeout);
+    const latency = Date.now() - t0;
+    if (!res.ok) {
+      lines.push(`1. Upstream API: ❌ HTTP ${res.status} ${escapeHtml(res.statusText)} (${latency}ms)`);
+    } else {
+      const body = (await res.json().catch(() => ({}))) as ScgAlertsResponse;
+      const alerts = Array.isArray(body?.alerts) ? body.alerts : [];
+      upstreamAlertCount = alerts.length;
+      // Newest = largest alert_time. Don't assume API order.
+      let newest: ScgAlertsResponse["alerts"][number] | null = null;
+      for (const a of alerts) {
+        if (!newest || a.alert_time > newest.alert_time) newest = a;
+      }
+      if (newest) {
+        newestKey = alertKey(newest);
+        newestName = newest.name;
+        newestAgeMins = newest.age_mins;
+      }
+      upstreamOk = true;
+      lines.push(`1. Upstream API: ✅ HTTP 200 · ${alerts.length} alerts · ${latency}ms`);
+    }
+  } catch (err) {
+    const msg = (err as Error)?.message ?? String(err);
+    lines.push(`1. Upstream API: ❌ ${escapeHtml(msg)}`);
+  }
+
+  // Check 2 — poller is processing what it receives. Compare newest upstream
+  // alert against the poller's in-memory dedup set. If upstream has alert X
+  // and dedup doesn't contain X, the poller isn't processing even though the
+  // network is fine. Also surface pause state + last successful tick age.
+  const health = getPollerHealth();
+  const now = Date.now();
+  const lastOkAgo = health.lastTickOkAt ? now - health.lastTickOkAt : Infinity;
+  const paused = isPaused();
+
+  if (!upstreamOk) {
+    lines.push("2. Poller processing: ⚠️ skipped (upstream unreachable)");
+  } else if (upstreamAlertCount === 0) {
+    lines.push("2. Poller processing: ⚠️ upstream returned 0 alerts — nothing to verify");
+  } else if (newestKey && hasSeenAlert(newestKey)) {
+    lines.push(
+      `2. Poller processing: ✅ newest upstream alert is in dedup set` +
+        (newestName ? ` (<code>${escapeHtml(newestName)}</code>, age ${newestAgeMins}m)` : ""),
+    );
+  } else {
+    lines.push(
+      `2. Poller processing: ❌ newest upstream alert NOT in dedup set — poller is behind or stalled` +
+        (newestName ? ` (<code>${escapeHtml(newestName)}</code>)` : ""),
+    );
+  }
+
+  // Check 3 — Telegram delivery. The reply itself is the proof; say so.
+  lines.push("3. Telegram delivery: ✅ (you're reading this message)");
+
+  // Runtime state useful for diagnosing
+  lines.push("");
+  lines.push("<b>Poller state</b>");
+  lines.push(`• last successful poll: ${formatAgo(lastOkAgo)}`);
+  lines.push(`• last HTTP status: ${health.lastHttpStatus ?? "—"}`);
+  if (health.lastTickError) {
+    lines.push(`• last error: <code>${escapeHtml(health.lastTickError)}</code>`);
+  }
+  lines.push(`• dedup set size: ${health.seenSize}`);
+  lines.push(`• paused: ${paused ? "🟡 yes — run /resume" : "no"}`);
+  lines.push(`• blacklisted mints: ${getBlacklist().length}`);
+  lines.push(
+    `• runtime: node ${process.version} · ${process.platform}/${process.arch} · poll every ${CONFIG.SCG_POLL_MS}ms`,
+  );
+
+  await tgPost("sendMessage", {
+    chat_id: chatId,
+    text: lines.join("\n"),
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1156,6 +1275,7 @@ export function startTelegramBot(): () => void {
       { command: "llm",       description: "Toggle the LLM exit advisor on/off" },
       { command: "pause",     description: "Stop taking new SCG alerts" },
       { command: "resume",    description: "Resume taking new SCG alerts" },
+      { command: "ping",      description: "Check upstream alerts API + poller + Telegram" },
       { command: "sellall",   description: "Emergency close-all (requires CONFIRM)" },
       { command: "skip",      description: "Blacklist a mint (or list/clear)" },
       { command: "mint",      description: "On-demand on-chain snapshot of any token" },
@@ -1230,6 +1350,7 @@ export function startTelegramBot(): () => void {
               case "/llm":       await handleLlm(chatId); break;
               case "/pause":     await handlePause(chatId); break;
               case "/resume":    await handleResume(chatId); break;
+              case "/ping":      await handlePing(chatId); break;
               case "/sellall":   await handleSellAll(chatId); break;
               case "/skip":      await handleSkip(chatId, argText); break;
               case "/mint":      await handleMint(chatId, argText); break;
