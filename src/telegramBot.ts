@@ -1160,7 +1160,8 @@ export function startTelegramBot(): () => void {
       { command: "skip",      description: "Blacklist a mint (or list/clear)" },
       { command: "mint",      description: "On-demand on-chain snapshot of any token" },
       { command: "wallet",    description: "Show wallet address + SOL balance" },
-      { command: "backtest",  description: "Run backtest + adopt live (add 'hybrid' for moonbag grid)" },
+      { command: "backtest",        description: "Run simple backtest (ARM × TRAIL × STOP) + adopt live" },
+      { command: "backtest_hybrid", description: "Run hybrid backtest (adds moonbag grid) + adopt live" },
       { command: "doctor",    description: "Run setup and runtime health checks" },
       { command: "setup_status", description: "Show setup checklist" },
       { command: "update",    description: "Pull latest code and restart via pm2" },
@@ -1233,7 +1234,8 @@ export function startTelegramBot(): () => void {
               case "/skip":      await handleSkip(chatId, argText); break;
               case "/mint":      await handleMint(chatId, argText); break;
               case "/wallet":    await handleWallet(chatId); break;
-              case "/backtest":  await handleBacktest(chatId, argText); break;
+              case "/backtest":        await handleBacktest(chatId, argText); break;
+              case "/backtest_hybrid": await handleBacktest(chatId, "hybrid"); break;
               case "/doctor":    await handleDoctor(chatId); break;
               case "/setup_status": await handleSetupStatus(chatId); break;
               case "/update":    await handleUpdate(chatId); break;
