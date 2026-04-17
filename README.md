@@ -146,7 +146,7 @@ cd moonbags
 npm install
 
 # 2. Install the OKX onchainos CLI (provides on-chain data)
-npm install -g onchainos
+curl -sSL https://raw.githubusercontent.com/okx/onchainos-skills/main/install.sh | sh
 
 # 3. Run the wizard
 npm run setup
@@ -235,14 +235,23 @@ Jupiter Ultra provides the swap routing. The free tier is sufficient.
 This is a **compiled Rust binary** (npm package) that wraps OKX's on-chain data API. It's used by both the price feed and the LLM advisor for smart-money trades, dev wallet activity, holder PnL, and kline data.
 
 ```bash
-npm install -g onchainos
+curl -sSL https://raw.githubusercontent.com/okx/onchainos-skills/main/install.sh | sh
 ```
+
+The installer places the `onchainos` binary on your user PATH, commonly under `~/.local/bin`. If `which onchainos` still returns nothing, open a new terminal or add that directory to your shell PATH.
 
 Verify it works:
 
 ```bash
 onchainos --version
+onchainos token trending --help
 onchainos market price --address So11111111111111111111111111111111111111112 --chain solana
+```
+
+Use `onchainos 2.1.0` or newer. If `/backtest` fails with `unrecognized subcommand 'trending'`, rerun the installer to update the CLI and restart the bot:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/okx/onchainos-skills/main/install.sh | sh
 ```
 
 Then create OnchainOS API credentials at [web3.okx.com/onchain-os/dev-portal](https://web3.okx.com/onchain-os/dev-portal). Use a read-only key and save the passphrase you set during creation.
@@ -461,6 +470,7 @@ Every command is gated to the `TELEGRAM_CHAT_ID` in `.env` — random users who 
 | `/mint <mint>` | On-demand on-chain snapshot for any token: price + 5m/1h/4h/24h % changes, smart money / bundler / dev flow, top-10 holder PnL, dev hold %, LP burn, GMGN link. |
 | `/wallet` | Full wallet address + SOL balance + Solscan link. |
 | `/backtest` | Run a live backtest on 100 trending Solana tokens (~60s). Shows top 5 ARM/TRAIL/STOP combos vs your current config. Tap a row to **adopt** — settings save to `.env` and apply on the next tick, no restart needed. |
+| `/update` | Check `origin/main`, show incoming commits, then pull + restart through `pm2` after confirmation. Requires `git` and a `pm2` process named `moonbags`. |
 
 ### Notification behaviour
 
@@ -678,6 +688,18 @@ sudo systemctl restart moonbags
 
 State is preserved. Positions in flight at the moment of restart are reconciled from your wallet balance and logged to `state/stranded.json`.
 
+### Updating from Telegram
+
+If the bot is running under `pm2`, `/update` can pull the latest `origin/main` and restart the bot for you:
+
+```bash
+npm install -g pm2
+pm2 start "npm run start" --name moonbags
+pm2 save
+```
+
+Then send `/update` in Telegram. The bot checks for `git`, refuses to update when the working tree has local edits or local-only commits, shows incoming commits, warns when positions are open, and requires a confirm tap before running `git pull --ff-only origin main`. If `package.json` or `package-lock.json` changed, it runs `npm install` before `pm2 restart moonbags --update-env`.
+
 ---
 
 ## Backtesting
@@ -750,6 +772,7 @@ Useful for manually evaluating a token before whitelisting it, or debugging why 
 The `onchainos` CLI is intermittently rate-limited or having auth issues. The bot **automatically falls back to Jupiter Ultra sell quotes** for affected tokens — no action needed. If it persists for >5 minutes, check:
 
 - Is `onchainos --version` working from the shell?
+- If `/backtest` says `unrecognized subcommand 'trending'`, update the CLI with `curl -sSL https://raw.githubusercontent.com/okx/onchainos-skills/main/install.sh | sh`, then restart the bot. `onchainos 2.1.0` supports `token trending`.
 - Are you on IPv4? `onchainos` does NOT support IPv6. Run `curl -6 -s https://ipv6.icanhazip.com || curl -s https://ipv4.icanhazip.com` — if you get an IPv6 response, disable IPv6 on your network interface.
 
 ### `MINIMAX_API_KEY missing — skipping LLM consult`

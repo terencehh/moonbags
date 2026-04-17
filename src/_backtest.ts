@@ -71,19 +71,98 @@ interface GridResult {
   beSaves: number;      // how many trades exited via break-even stop (saved from loss)
 }
 
+type OnchainosResponse<T> = {
+  ok?: boolean;
+  data?: T;
+  error?: string;
+};
+
+type CliError = Error & {
+  code?: number | string;
+  signal?: string;
+  stdout?: string | Buffer;
+  stderr?: string | Buffer;
+};
+
+function onchainosEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  if (!env.OKX_PASSPHRASE && env.OKX_API_PASSPHRASE) {
+    env.OKX_PASSPHRASE = env.OKX_API_PASSPHRASE;
+  }
+  return env;
+}
+
+function describeCliError(err: unknown): string {
+  const e = err as CliError;
+  const chunks = [
+    e.message,
+    String(e.stderr ?? "").trim(),
+    String(e.stdout ?? "").trim(),
+  ].filter(Boolean);
+  return chunks.join(" | ").slice(0, 800);
+}
+
+async function runOnchainosJson<T>(args: string[], timeout: number): Promise<T> {
+  try {
+    const { stdout } = await execFileAsync("onchainos", args, {
+      timeout,
+      env: onchainosEnv(),
+    });
+    const parsed = JSON.parse(String(stdout)) as OnchainosResponse<T>;
+    if (parsed.ok === false) {
+      throw new Error(parsed.error ?? "onchainos returned ok=false");
+    }
+    return parsed.data as T;
+  } catch (err) {
+    throw new Error(`onchainos ${args.join(" ")} failed: ${describeCliError(err)}`);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Fetch top 100 trending Solana tokens (sorted by 24h volume)
 // ---------------------------------------------------------------------------
 async function fetchTrendingTokens(): Promise<TokenSample[]> {
-  const { stdout } = await execFileAsync("onchainos", [
-    "token", "trending",
-    "--chain", "solana",
-    "--sort-by", "5",      // volume
-    "--time-frame", "4",   // 24h
-  ], { timeout: 15_000 });
+  type RawToken = { tokenContractAddress: string; tokenSymbol: string };
+  const attempts: Array<{ label: string; args: string[] }> = [
+    {
+      label: "token trending",
+      args: [
+        "token", "trending",
+        "--chain", "solana",
+        "--sort-by", "5",      // volume
+        "--time-frame", "4",   // 24h
+      ],
+    },
+    {
+      label: "token hot-tokens",
+      args: [
+        "token", "hot-tokens",
+        "--chain", "solana",
+        "--rank-by", "5",      // volume
+        "--time-frame", "4",   // 24h
+      ],
+    },
+  ];
 
-  const j = JSON.parse(stdout) as { data?: Array<{ tokenContractAddress: string; tokenSymbol: string }> };
-  return (j.data ?? []).map(t => ({ address: t.tokenContractAddress, symbol: t.tokenSymbol }));
+  const errors: string[] = [];
+  for (const attempt of attempts) {
+    try {
+      const rows = await runOnchainosJson<RawToken[]>(attempt.args, 15_000);
+      const tokens = (rows ?? [])
+        .map(t => ({ address: t.tokenContractAddress, symbol: t.tokenSymbol }))
+        .filter(t => t.address && t.symbol);
+      if (tokens.length > 0) return tokens;
+      errors.push(`${attempt.label}: returned no tokens`);
+    } catch (err) {
+      errors.push(`${attempt.label}: ${(err as Error).message}`);
+    }
+  }
+
+  throw new Error(
+    "Unable to fetch OKX token list. Upgrade onchainos with `onchainos upgrade` " +
+    "or `npm install -g onchainos`, then verify `onchainos token trending --help`. " +
+    `Attempts: ${errors.join(" || ")}`,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -91,22 +170,17 @@ async function fetchTrendingTokens(): Promise<TokenSample[]> {
 // ---------------------------------------------------------------------------
 async function fetchKlines(address: string, bar: string = BAR): Promise<Candle[]> {
   try {
-    const { stdout } = await execFileAsync("onchainos", [
+    const data = await runOnchainosJson<Array<{ ts: string; o: string; h: string; l: string; c: string }>>([
       "market", "kline",
       "--address", address,
       "--chain", "solana",
       "--bar", bar,
       "--limit", "299",
-    ], { timeout: 10_000 });
+    ], 10_000);
 
-    const j = JSON.parse(stdout) as {
-      ok: boolean;
-      data?: Array<{ ts: string; o: string; h: string; l: string; c: string }>;
-    };
+    if (!data?.length) return [];
 
-    if (!j.ok || !j.data?.length) return [];
-
-    return j.data
+    return data
       .map(c => ({
         ts:    Number(c.ts),
         open:  parseFloat(c.o),

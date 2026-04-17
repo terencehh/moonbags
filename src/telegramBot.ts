@@ -6,6 +6,13 @@ import { isPaused, setPaused, addToBlacklist, removeFromBlacklist, getBlacklist 
 import { getPositionSnapshot } from "./okxClient.js";
 import { escapeHtml } from "./notifier.js";
 import { runBacktest } from "./_backtest.js";
+import {
+  getUpdateBlocker,
+  getUpdatePreview,
+  pullUpdate,
+  restartWithPm2,
+  type UpdatePreview,
+} from "./updateManager.js";
 import type { Position } from "./types.js";
 
 type Update = {
@@ -151,21 +158,22 @@ async function promptForEdit(chatId: number, key: SettableKey): Promise<void> {
 
 async function applyEdit(chatId: number, key: SettableKey, raw: string): Promise<void> {
   const result = setConfigValue(key, raw.trim());
-  if (result.ok) {
-    const v = (CONFIG as unknown as Record<string, unknown>)[key] as number | boolean;
-    await tgPost("sendMessage", {
-      chat_id: chatId,
-      text: `✅ <b>${SETTINGS_LABELS[key]}</b> → <b>${escapeHtml(SETTABLE_SPECS[key].display(v))}</b>\n<i>Saved to .env. Live now.</i>`,
-      parse_mode: "HTML",
-    });
-    logger.info({ key, value: v }, "[settings] updated via telegram");
-  } else {
+  if (result.ok === false) {
     await tgPost("sendMessage", {
       chat_id: chatId,
       text: `❌ Could not update <b>${SETTINGS_LABELS[key]}</b>: ${result.error}`,
       parse_mode: "HTML",
     });
+    return;
   }
+
+  const v = (CONFIG as unknown as Record<string, unknown>)[key] as number | boolean;
+  await tgPost("sendMessage", {
+    chat_id: chatId,
+    text: `✅ <b>${SETTINGS_LABELS[key]}</b> → <b>${escapeHtml(SETTABLE_SPECS[key].display(v))}</b>\n<i>Saved to .env. Live now.</i>`,
+    parse_mode: "HTML",
+  });
+  logger.info({ key, value: v }, "[settings] updated via telegram");
 }
 
 async function sendStartMenu(chatId: number): Promise<void> {
@@ -269,6 +277,18 @@ async function handleCallback(cq: NonNullable<Update["callback_query"]>): Promis
     return;
   }
 
+  if (data === "update:confirm") {
+    await tgPost("answerCallbackQuery", { callback_query_id: cq.id, text: "Updating..." });
+    await handleUpdateConfirmed(chatId);
+    return;
+  }
+
+  if (data === "update:cancel") {
+    await tgPost("answerCallbackQuery", { callback_query_id: cq.id, text: "Cancelled" });
+    await tgPost("sendMessage", { chat_id: chatId, text: "❌ Update cancelled. Code unchanged." });
+    return;
+  }
+
   if (data.startsWith("adopt:")) {
     await tgPost("answerCallbackQuery", { callback_query_id: cq.id });
     await handleAdopt(chatId, data);
@@ -293,17 +313,18 @@ async function handleCallback(cq: NonNullable<Update["callback_query"]>): Promis
       return;
     }
     const result = toggleConfigValue(key);
-    if (result.ok) {
-      const v = (CONFIG as unknown as Record<string, unknown>)[key] as boolean;
-      await tgPost("answerCallbackQuery", {
-        callback_query_id: cq.id,
-        text: `${SETTINGS_LABELS[key]}: ${SETTABLE_SPECS[key].display(v)}`,
-      });
-      await sendSettingsMenu(chatId);  // refresh menu so they see the new state
-      logger.info({ key, value: v }, "[settings] toggled via telegram");
-    } else {
+    if (result.ok === false) {
       await tgPost("answerCallbackQuery", { callback_query_id: cq.id, text: `❌ ${result.error}`, show_alert: true });
+      return;
     }
+
+    const v = (CONFIG as unknown as Record<string, unknown>)[key] as boolean;
+    await tgPost("answerCallbackQuery", {
+      callback_query_id: cq.id,
+      text: `${SETTINGS_LABELS[key]}: ${SETTABLE_SPECS[key].display(v)}`,
+    });
+    await sendSettingsMenu(chatId);  // refresh menu so they see the new state
+    logger.info({ key, value: v }, "[settings] toggled via telegram");
     return;
   }
 
@@ -464,7 +485,7 @@ async function handleHistory(chatId: number, argText: string): Promise<void> {
 // ---------------------------------------------------------------------------
 async function handleLlm(chatId: number): Promise<void> {
   const result = toggleConfigValue("LLM_EXIT_ENABLED");
-  if (!result.ok) {
+  if (result.ok === false) {
     await tgPost("sendMessage", { chat_id: chatId, text: `❌ ${result.error}` });
     return;
   }
@@ -694,6 +715,125 @@ async function handleBacktest(chatId: number): Promise<void> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// /update — pull origin/main and restart through pm2.
+// ---------------------------------------------------------------------------
+function formatUpdatePreview(preview: UpdatePreview): string {
+  const blocker = getUpdateBlocker(preview);
+  const openCount = getPositions().filter((p) => p.status === "open" || p.status === "opening").length;
+  const lines: string[] = [
+    "🔄 <b>MoonBags update check</b>",
+    "",
+    `Current: <code>${escapeHtml(preview.currentSha)}</code>`,
+    `Remote:  <code>${escapeHtml(preview.remoteSha)}</code>`,
+    `Behind: <b>${preview.behind}</b> commit(s)  ·  Ahead: <b>${preview.ahead}</b>`,
+    `Open positions: <b>${openCount}</b>`,
+    "",
+  ];
+
+  if (preview.commits.length > 0) {
+    lines.push("<b>Incoming commits:</b>");
+    for (const commit of preview.commits) {
+      lines.push(`• <code>${escapeHtml(commit)}</code>`);
+    }
+    lines.push("");
+  }
+
+  if (preview.packageFilesChanged) {
+    lines.push("📦 <i>package files changed; npm install will run.</i>");
+  }
+  if (openCount > 0) {
+    lines.push("⚠️ <i>Restart pauses management briefly while pm2 brings the bot back.</i>");
+  }
+
+  if (blocker) {
+    lines.push(`\n❌ <b>Cannot update:</b> ${escapeHtml(blocker)}`);
+    if (!preview.pm2Available || !preview.pm2ProcessOnline) {
+      lines.push(
+        "\nSetup pm2 first:\n" +
+        `<code>npm install -g pm2\npm2 start "npm run start" --name moonbags\npm2 save</code>`,
+      );
+    }
+  } else {
+    lines.push("\nTap confirm to pull <code>origin/main</code> and restart <code>moonbags</code> with pm2.");
+  }
+
+  return lines.join("\n");
+}
+
+async function handleUpdate(chatId: number): Promise<void> {
+  try {
+    const preview = await getUpdatePreview();
+    const blocker = getUpdateBlocker(preview);
+    await tgPost("sendMessage", {
+      chat_id: chatId,
+      text: formatUpdatePreview(preview),
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+      reply_markup: blocker ? undefined : {
+        inline_keyboard: [
+          [{ text: "✅ Confirm Update + Restart", callback_data: "update:confirm" }],
+          [{ text: "❌ Cancel", callback_data: "update:cancel" }],
+        ],
+      },
+    });
+  } catch (err) {
+    await tgPost("sendMessage", {
+      chat_id: chatId,
+      text: `❌ Update check failed: ${escapeHtml((err as Error).message)}`,
+      parse_mode: "HTML",
+    });
+  }
+}
+
+async function handleUpdateConfirmed(chatId: number): Promise<void> {
+  try {
+    const preview = await getUpdatePreview();
+    const blocker = getUpdateBlocker(preview);
+    if (blocker) {
+      await tgPost("sendMessage", {
+        chat_id: chatId,
+        text: `❌ Update aborted: ${escapeHtml(blocker)}`,
+        parse_mode: "HTML",
+      });
+      return;
+    }
+
+    await tgPost("sendMessage", {
+      chat_id: chatId,
+      text: "⏳ Pulling latest <code>origin/main</code>...",
+      parse_mode: "HTML",
+    });
+
+    const result = await pullUpdate(preview);
+    const lines = [
+      "✅ <b>Update pulled</b>",
+      `${escapeHtml(result.previousSha)} → ${escapeHtml(result.currentSha)}`,
+      result.packageFilesChanged ? "📦 npm install completed." : "📦 Dependencies unchanged.",
+      "",
+      "🔁 Restarting <code>moonbags</code> with pm2 now...",
+    ];
+
+    await tgPost("sendMessage", {
+      chat_id: chatId,
+      text: lines.join("\n"),
+      parse_mode: "HTML",
+    });
+
+    setTimeout(() => {
+      restartWithPm2().catch((err) => {
+        logger.error({ err: (err as Error).message }, "[telegram] pm2 restart failed after update");
+      });
+    }, 750).unref?.();
+  } catch (err) {
+    await tgPost("sendMessage", {
+      chat_id: chatId,
+      text: `❌ Update failed: ${escapeHtml((err as Error).message)}`,
+      parse_mode: "HTML",
+    });
+  }
+}
+
 // First-tap handler — does NOT apply. Shows a side-by-side diff vs current
 // settings and asks for explicit confirmation. The confirm tap uses the
 // callback_data prefix `confirm-adopt:` to route to the actual apply path.
@@ -818,6 +958,7 @@ export function startTelegramBot(): () => void {
       { command: "mint",      description: "On-demand on-chain snapshot of any token" },
       { command: "wallet",    description: "Show wallet address + SOL balance" },
       { command: "backtest",  description: "Run backtest + adopt optimal ARM/TRAIL/STOP live" },
+      { command: "update",    description: "Pull latest code and restart via pm2" },
     ],
   });
 
@@ -888,6 +1029,7 @@ export function startTelegramBot(): () => void {
               case "/mint":      await handleMint(chatId, argText); break;
               case "/wallet":    await handleWallet(chatId); break;
               case "/backtest":  await handleBacktest(chatId); break;
+              case "/update":    await handleUpdate(chatId); break;
             }
           } catch (err) {
             logger.warn({ err: (err as Error).message, cmd }, "[telegram] command handler threw");
