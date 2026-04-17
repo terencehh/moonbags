@@ -17,9 +17,52 @@ export type AlertEvent = {
   reason?: string;
 };
 
-const SCG_URL = "https://api.scgalpha.com/api/alerts";
+export const SCG_URL = "https://api.scgalpha.com/api/alerts";
 const DEDUP_CAP = 5000;
 const RECENT_CAP = 200;
+
+export function alertKey(a: Pick<ScgAlert, "mint" | "alert_time">): string {
+  return `${a.mint}:${a.alert_time}`;
+}
+
+// ---------------------------------------------------------------------------
+// Poller health — updated from inside startScgPoller's tick() so /ping can
+// report whether the upstream is reachable and whether the poller is actually
+// processing what it receives. Readable via getPollerHealth() / hasSeenAlert().
+// ---------------------------------------------------------------------------
+let pollerStartedAt = 0;
+let lastTickStartedAt = 0;
+let lastTickOkAt = 0;
+let lastTickError: string | null = null;
+let lastHttpStatus: number | null = null;
+let lastAlertCount = 0;
+let seenRef: Set<string> | null = null;
+
+export type PollerHealth = {
+  startedAt: number;
+  lastTickStartedAt: number;
+  lastTickOkAt: number;
+  lastTickError: string | null;
+  lastHttpStatus: number | null;
+  lastAlertCount: number;
+  seenSize: number;
+};
+
+export function getPollerHealth(): PollerHealth {
+  return {
+    startedAt: pollerStartedAt,
+    lastTickStartedAt,
+    lastTickOkAt,
+    lastTickError,
+    lastHttpStatus,
+    lastAlertCount,
+    seenSize: seenRef?.size ?? 0,
+  };
+}
+
+export function hasSeenAlert(key: string): boolean {
+  return seenRef?.has(key) ?? false;
+}
 
 const recentEvents: AlertEvent[] = [];
 
@@ -95,6 +138,9 @@ export function startScgPoller(onNew: AlertHandler): () => void {
   let isRunning = false;
   let seeded = false;
 
+  pollerStartedAt = Date.now();
+  seenRef = seen;
+
   function remember(key: string): void {
     if (seen.has(key)) return;
     seen.add(key);
@@ -103,10 +149,6 @@ export function startScgPoller(onNew: AlertHandler): () => void {
       const evict = seenOrder.shift();
       if (evict !== undefined) seen.delete(evict);
     }
-  }
-
-  function keyOf(a: ScgAlert): string {
-    return `${a.mint}:${a.alert_time}`;
   }
 
   function passesFilters(a: ScgAlert): { ok: boolean; reason?: string } {
@@ -140,18 +182,24 @@ export function startScgPoller(onNew: AlertHandler): () => void {
       return;
     }
     isRunning = true;
+    lastTickStartedAt = Date.now();
     try {
       logger.debug("[scgPoller] polling");
       const res = await fetch(SCG_URL);
+      lastHttpStatus = res.status;
       if (!res.ok) {
+        lastTickError = `HTTP ${res.status} ${res.statusText}`;
         logger.error({ status: res.status, statusText: res.statusText }, "[scgPoller] non-OK response");
         return;
       }
       const body = (await res.json()) as ScgAlertsResponse;
       const alerts = Array.isArray(body?.alerts) ? body.alerts : [];
+      lastAlertCount = alerts.length;
+      lastTickError = null;
+      lastTickOkAt = Date.now();
 
       if (!seeded) {
-        for (const a of alerts) remember(keyOf(a));
+        for (const a of alerts) remember(alertKey(a));
         seeded = true;
         logger.debug({ count: alerts.length }, "[scgPoller] seeded dedup set on first poll");
         return;
@@ -159,7 +207,7 @@ export function startScgPoller(onNew: AlertHandler): () => void {
 
       const fresh: ScgAlert[] = [];
       for (const a of alerts) {
-        const k = keyOf(a);
+        const k = alertKey(a);
         if (seen.has(k)) continue;
         remember(k);
         if (paused) {
@@ -223,6 +271,7 @@ export function startScgPoller(onNew: AlertHandler): () => void {
         }),
       );
     } catch (err) {
+      lastTickError = (err as Error)?.message ?? String(err);
       logger.error({ err }, "[scgPoller] poll failed");
     } finally {
       isRunning = false;
