@@ -36,6 +36,20 @@ export type PullUpdateResult = {
   npmInstallOutput?: string;
 };
 
+export type UpdateBlockerCode =
+  | "dirty_worktree"
+  | "local_commits"
+  | "up_to_date"
+  | "pm2_missing"
+  | "pm2_process_missing";
+
+export type UpdateBlocker = {
+  code: UpdateBlockerCode;
+  title: string;
+  detail: string;
+  nextSteps: string[];
+};
+
 async function run(command: string, args: string[], timeout: number): Promise<CommandResult> {
   const { stdout, stderr } = await execFileAsync(command, args, { timeout });
   return { stdout: String(stdout).trim(), stderr: String(stderr).trim() };
@@ -103,28 +117,70 @@ export async function getUpdatePreview(): Promise<UpdatePreview> {
   };
 }
 
-export function getUpdateBlocker(preview: UpdatePreview): string | null {
+export function getUpdateBlockerDetails(preview: UpdatePreview): UpdateBlocker | null {
   if (preview.dirtyFiles.length > 0) {
-    return `Working tree has ${preview.dirtyFiles.length} local change(s). Commit, stash, or discard them before updating.`;
+    return {
+      code: "dirty_worktree",
+      title: "Local file changes found",
+      detail: `Working tree has ${preview.dirtyFiles.length} local change(s).`,
+      nextSteps: [
+        "Commit or stash local edits before updating.",
+        "If this is a fresh install, ask support before deleting local files.",
+      ],
+    };
   }
   if (preview.ahead > 0) {
-    return `Local branch has ${preview.ahead} commit(s) not on ${REMOTE}/${BRANCH}. Refusing to pull over local work.`;
+    return {
+      code: "local_commits",
+      title: "Local commits found",
+      detail: `Local branch has ${preview.ahead} commit(s) not on ${REMOTE}/${BRANCH}.`,
+      nextSteps: [
+        "Push or merge local commits manually.",
+        "Then rerun /update.",
+      ],
+    };
   }
   if (preview.behind === 0) {
-    return "Already up to date.";
+    return {
+      code: "up_to_date",
+      title: "Already up to date",
+      detail: "This bot already has the latest remote code.",
+      nextSteps: [],
+    };
   }
   if (!preview.pm2Available) {
-    return "pm2 is not installed or not on PATH. Install it with `npm install -g pm2`.";
+    return {
+      code: "pm2_missing",
+      title: "PM2 is missing",
+      detail: "pm2 is not installed or not on PATH.",
+      nextSteps: [
+        "npm install -g pm2",
+        "pm2 start \"npm run start\" --name moonbags",
+        "pm2 save",
+      ],
+    };
   }
   if (!preview.pm2ProcessOnline) {
-    return `pm2 process "${PM2_PROCESS}" was not found. Start it with \`pm2 start "npm run start" --name ${PM2_PROCESS}\`.`;
+    return {
+      code: "pm2_process_missing",
+      title: "MoonBags is not managed by PM2",
+      detail: `pm2 process "${PM2_PROCESS}" was not found.`,
+      nextSteps: [
+        `PATH="$HOME/.local/bin:$PATH" pm2 start "npm run start" --name ${PM2_PROCESS}`,
+        "pm2 save",
+      ],
+    };
   }
   return null;
 }
 
+export function getUpdateBlocker(preview: UpdatePreview): string | null {
+  return getUpdateBlockerDetails(preview)?.detail ?? null;
+}
+
 export async function pullUpdate(preview: UpdatePreview): Promise<PullUpdateResult> {
-  const blocker = getUpdateBlocker(preview);
-  if (blocker) throw new Error(blocker);
+  const blocker = getUpdateBlockerDetails(preview);
+  if (blocker) throw new Error(blocker.detail);
 
   const previousSha = await git(["rev-parse", "--short", "HEAD"]);
   const pullOutput = await git(["pull", "--ff-only", REMOTE, BRANCH], 60_000);

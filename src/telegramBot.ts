@@ -7,12 +7,14 @@ import { getPositionSnapshot } from "./okxClient.js";
 import { escapeHtml } from "./notifier.js";
 import { runBacktest } from "./_backtest.js";
 import {
-  getUpdateBlocker,
+  getUpdateBlockerDetails,
   getUpdatePreview,
   pullUpdate,
   restartWithPm2,
+  type UpdateBlocker,
   type UpdatePreview,
 } from "./updateManager.js";
+import { formatDoctorHtml, runDoctor, type DoctorReport } from "./doctor.js";
 import type { Position } from "./types.js";
 
 type Update = {
@@ -286,6 +288,18 @@ async function handleCallback(cq: NonNullable<Update["callback_query"]>): Promis
   if (data === "update:cancel") {
     await tgPost("answerCallbackQuery", { callback_query_id: cq.id, text: "Cancelled" });
     await tgPost("sendMessage", { chat_id: chatId, text: "❌ Update cancelled. Code unchanged." });
+    return;
+  }
+
+  if (data === "doctor:refresh") {
+    await tgPost("answerCallbackQuery", { callback_query_id: cq.id, text: "Running..." });
+    await handleDoctor(chatId);
+    return;
+  }
+
+  if (data === "setup:refresh") {
+    await tgPost("answerCallbackQuery", { callback_query_id: cq.id, text: "Refreshing..." });
+    await handleSetupStatus(chatId);
     return;
   }
 
@@ -595,6 +609,56 @@ async function handleWallet(chatId: number): Promise<void> {
   });
 }
 
+function formatSetupStatusHtml(report: DoctorReport): string {
+  const setupIds = new Set([
+    "os",
+    "node",
+    "git",
+    "npm",
+    "env:file",
+    "env:JUP_API_KEY",
+    "env:HELIUS_API_KEY",
+    "env:PRIV_B58",
+    "env:okx",
+    "env:telegram",
+    "onchainos:version",
+    "onchainos:trending",
+    "pm2",
+    "pm2:moonbags",
+  ]);
+  return formatDoctorHtml({
+    ok: report.checks.filter((check) => setupIds.has(check.id)).every((check) => check.status !== "fail"),
+    checks: report.checks.filter((check) => setupIds.has(check.id)),
+  }, "MoonBags Setup Status");
+}
+
+async function handleDoctor(chatId: number): Promise<void> {
+  await tgPost("sendMessage", { chat_id: chatId, text: "🩺 Running doctor checks..." });
+  const report = await runDoctor({ network: true });
+  await tgPost("sendMessage", {
+    chat_id: chatId,
+    text: formatDoctorHtml(report),
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+    reply_markup: {
+      inline_keyboard: [[{ text: "🔄 Run doctor again", callback_data: "doctor:refresh" }]],
+    },
+  });
+}
+
+async function handleSetupStatus(chatId: number): Promise<void> {
+  const report = await runDoctor({ network: false });
+  await tgPost("sendMessage", {
+    chat_id: chatId,
+    text: formatSetupStatusHtml(report),
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+    reply_markup: {
+      inline_keyboard: [[{ text: "🔄 Refresh setup status", callback_data: "setup:refresh" }]],
+    },
+  });
+}
+
 // ---------------------------------------------------------------------------
 // /backtest — run a backtest on 100 trending Solana tokens, present top 5
 // combos vs the user's current config, and let them adopt any row with a
@@ -718,8 +782,31 @@ async function handleBacktest(chatId: number): Promise<void> {
 // ---------------------------------------------------------------------------
 // /update — pull origin/main and restart through pm2.
 // ---------------------------------------------------------------------------
+function formatUpdateBlocker(blocker: UpdateBlocker, preview?: UpdatePreview): string[] {
+  if (blocker.code === "up_to_date") {
+    return [`✅ <b>${escapeHtml(blocker.title)}</b> — ${escapeHtml(blocker.detail)}`];
+  }
+
+  const lines = [`❌ <b>Cannot update:</b> ${escapeHtml(blocker.title)}`, escapeHtml(blocker.detail)];
+  if (blocker.code === "dirty_worktree" && preview) {
+    const shown = preview.dirtyFiles.slice(0, 8);
+    if (shown.length > 0) {
+      lines.push("", "<b>Local changes:</b>");
+      for (const file of shown) lines.push(`• <code>${escapeHtml(file)}</code>`);
+      if (preview.dirtyFiles.length > shown.length) {
+        lines.push(`• ...and ${preview.dirtyFiles.length - shown.length} more`);
+      }
+    }
+  }
+  if (blocker.nextSteps.length > 0) {
+    lines.push("", "<b>Fix:</b>");
+    for (const step of blocker.nextSteps) lines.push(`<code>${escapeHtml(step)}</code>`);
+  }
+  return lines;
+}
+
 function formatUpdatePreview(preview: UpdatePreview): string {
-  const blocker = getUpdateBlocker(preview);
+  const blocker = getUpdateBlockerDetails(preview);
   const openCount = getPositions().filter((p) => p.status === "open" || p.status === "opening").length;
   const lines: string[] = [
     "🔄 <b>MoonBags update check</b>",
@@ -747,13 +834,7 @@ function formatUpdatePreview(preview: UpdatePreview): string {
   }
 
   if (blocker) {
-    lines.push(`\n❌ <b>Cannot update:</b> ${escapeHtml(blocker)}`);
-    if (!preview.pm2Available || !preview.pm2ProcessOnline) {
-      lines.push(
-        "\nSetup pm2 first:\n" +
-        `<code>npm install -g pm2\npm2 start "npm run start" --name moonbags\npm2 save</code>`,
-      );
-    }
+    lines.push("", ...formatUpdateBlocker(blocker, preview));
   } else {
     lines.push("\nTap confirm to pull <code>origin/main</code> and restart <code>moonbags</code> with pm2.");
   }
@@ -764,7 +845,7 @@ function formatUpdatePreview(preview: UpdatePreview): string {
 async function handleUpdate(chatId: number): Promise<void> {
   try {
     const preview = await getUpdatePreview();
-    const blocker = getUpdateBlocker(preview);
+    const blocker = getUpdateBlockerDetails(preview);
     await tgPost("sendMessage", {
       chat_id: chatId,
       text: formatUpdatePreview(preview),
@@ -789,11 +870,11 @@ async function handleUpdate(chatId: number): Promise<void> {
 async function handleUpdateConfirmed(chatId: number): Promise<void> {
   try {
     const preview = await getUpdatePreview();
-    const blocker = getUpdateBlocker(preview);
+    const blocker = getUpdateBlockerDetails(preview);
     if (blocker) {
       await tgPost("sendMessage", {
         chat_id: chatId,
-        text: `❌ Update aborted: ${escapeHtml(blocker)}`,
+        text: formatUpdateBlocker(blocker, preview).join("\n"),
         parse_mode: "HTML",
       });
       return;
@@ -958,6 +1039,8 @@ export function startTelegramBot(): () => void {
       { command: "mint",      description: "On-demand on-chain snapshot of any token" },
       { command: "wallet",    description: "Show wallet address + SOL balance" },
       { command: "backtest",  description: "Run backtest + adopt optimal ARM/TRAIL/STOP live" },
+      { command: "doctor",    description: "Run setup and runtime health checks" },
+      { command: "setup_status", description: "Show setup checklist" },
       { command: "update",    description: "Pull latest code and restart via pm2" },
     ],
   });
@@ -1029,6 +1112,8 @@ export function startTelegramBot(): () => void {
               case "/mint":      await handleMint(chatId, argText); break;
               case "/wallet":    await handleWallet(chatId); break;
               case "/backtest":  await handleBacktest(chatId); break;
+              case "/doctor":    await handleDoctor(chatId); break;
+              case "/setup_status": await handleSetupStatus(chatId); break;
               case "/update":    await handleUpdate(chatId); break;
             }
           } catch (err) {

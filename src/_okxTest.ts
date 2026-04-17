@@ -76,7 +76,9 @@ async function main() {
   if (snap.kline1m.length > 0) {
     const last = snap.kline1m[snap.kline1m.length - 1];
     const first = snap.kline1m[0];
-    console.log(`   first $${first.close.toExponential(3)}  →  last $${last.close.toExponential(3)}  (${(((last.close/first.close)-1)*100).toFixed(1)}% over ${snap.kline1m.length}m)`);
+    if (first && last) {
+      console.log(`   first $${first.close.toExponential(3)}  →  last $${last.close.toExponential(3)}  (${(((last.close/first.close)-1)*100).toFixed(1)}% over ${snap.kline1m.length}m)`);
+    }
   }
   console.log("");
 }

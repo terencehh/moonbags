@@ -192,7 +192,8 @@ async function main(): Promise<void> {
   } else {
     console.log(`${coral("✗")} onchainos CLI not found on PATH.`);
     console.log(gray("   It's required for price feeds + LLM advisor on-chain data."));
-    console.log(`   Install with:  ${yellow("npm install -g onchainos")}`);
+    console.log(`   Install with:  ${yellow("npm run install:onchainos")}`);
+    console.log(`   Then run:      ${yellow('export PATH="$HOME/.local/bin:$PATH"')}`);
     const cont = await askYesNo("   Continue anyway?", false);
     if (!cont) { rl.close(); process.exit(1); }
   }

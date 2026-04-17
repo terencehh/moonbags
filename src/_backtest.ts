@@ -20,7 +20,7 @@ const execFileAsync = promisify(execFile);
 // ---------------------------------------------------------------------------
 const arg = (flag: string, def: string) => {
   const i = process.argv.indexOf(flag);
-  return i !== -1 ? process.argv[i + 1] : def;
+  return i !== -1 ? (process.argv[i + 1] ?? def) : def;
 };
 const BAR         = arg("--bar", "5m");
 const TOP_N       = parseInt(arg("--top", "15"));
@@ -159,8 +159,8 @@ async function fetchTrendingTokens(): Promise<TokenSample[]> {
   }
 
   throw new Error(
-    "Unable to fetch OKX token list. Upgrade onchainos with `onchainos upgrade` " +
-    "or `npm install -g onchainos`, then verify `onchainos token trending --help`. " +
+    "Unable to fetch OKX token list. Update onchainos with `npm run install:onchainos`, " +
+    "then verify `onchainos token trending --help`. " +
     `Attempts: ${errors.join(" || ")}`,
   );
 }
@@ -207,7 +207,9 @@ function simulate(
   breakEvenAfter = 0,   // if > 0, once price crosses (1+breakEvenAfter), stop floor moves to entry
   hardTPPct = 0,        // if > 0, sell everything at the TP level (1+hardTPPct)
 ): SimResult {
-  const rawEntry = candles[0].open;
+  const firstCandle = candles[0];
+  if (!firstCandle) return { exitPct: 0, reason: "holding" };
+  const rawEntry = firstCandle.open;
   if (!rawEntry || rawEntry <= 0) return { exitPct: 0, reason: "holding" };
 
   // Apply fee + slippage haircut: each swap costs (FEE_BPS + SLIPPAGE_BPS)/10000
@@ -299,7 +301,7 @@ function simulate(
   }
 
   // end of data — mark-to-market remaining position (apply haircut as if sold)
-  const lastClose = candles[candles.length - 1].close;
+  const lastClose = candles[candles.length - 1]?.close ?? entry;
   realizedPnl += position * (adjSell(lastClose) / entry - 1);
   return { exitPct: realizedPnl * 100, reason: "holding" };
 }
@@ -440,7 +442,7 @@ async function main(): Promise<void> {
   }
 
   // 3. Build grid combos
-  const barMs = BAR_MS[BAR] ?? 300_000;
+  const barMs = BAR_MS[BAR as keyof typeof BAR_MS] ?? 300_000;
   type Combo = { arm: number; trail: number; stop: number; soPct: number; soMult: number; mbPct: number; mbTrail: number; mbTimeout: number; breakEvenAfter: number; hardTPPct: number };
   const combos: Combo[] = [];
 
@@ -575,11 +577,13 @@ async function main(): Promise<void> {
   }
 
   const best = results[0];
-  const bestLabel = isHybrid
-    ? `ARM ${(best.arm*100).toFixed(0)}%  TRAIL ${(best.trail*100).toFixed(0)}%  STOP ${(best.stop*100).toFixed(0)}%  SO ${(best.scaleoutPct*100).toFixed(0)}%@${best.scaleoutMult || "–"}x  MB ${(best.moonbagPct*100).toFixed(0)}% trail=${best.mbTrail ? (best.mbTrail*100).toFixed(0)+"%" : "–"} timeout=${best.mbTimeout || "–"}m`
-    : `ARM ${(best.arm*100).toFixed(0)}%  TRAIL ${(best.trail*100).toFixed(0)}%  STOP ${(best.stop*100).toFixed(0)}%`;
-  console.log(`\n  Best: ${bestLabel}`);
-  console.log(`   Total PnL: ${best.totalPnlPct >= 0 ? "+" : ""}${best.totalPnlPct.toFixed(1)}%  avg/trade: ${best.avgExitPct >= 0 ? "+" : ""}${best.avgExitPct.toFixed(1)}%  wins: ${best.wins}/${best.trades}\n`);
+  if (best) {
+    const bestLabel = isHybrid
+      ? `ARM ${(best.arm*100).toFixed(0)}%  TRAIL ${(best.trail*100).toFixed(0)}%  STOP ${(best.stop*100).toFixed(0)}%  SO ${(best.scaleoutPct*100).toFixed(0)}%@${best.scaleoutMult || "–"}x  MB ${(best.moonbagPct*100).toFixed(0)}% trail=${best.mbTrail ? (best.mbTrail*100).toFixed(0)+"%" : "–"} timeout=${best.mbTimeout || "–"}m`
+      : `ARM ${(best.arm*100).toFixed(0)}%  TRAIL ${(best.trail*100).toFixed(0)}%  STOP ${(best.stop*100).toFixed(0)}%`;
+    console.log(`\n  Best: ${bestLabel}`);
+    console.log(`   Total PnL: ${best.totalPnlPct >= 0 ? "+" : ""}${best.totalPnlPct.toFixed(1)}%  avg/trade: ${best.avgExitPct >= 0 ? "+" : ""}${best.avgExitPct.toFixed(1)}%  wins: ${best.wins}/${best.trades}\n`);
+  }
 
   // 5. Export CSV
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);

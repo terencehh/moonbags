@@ -28,7 +28,7 @@ Use at your own risk.
 2. [What it does](#what-it-does)
 3. [Architecture at a glance](#architecture-at-a-glance)
 4. [Prerequisites](#prerequisites)
-5. [Quick start — the setup wizard (recommended)](#quick-start--the-setup-wizard-recommended)
+5. [Quick start — one-command onboarding](#quick-start--one-command-onboarding)
 6. [Manual setup (reference)](#manual-setup-reference)
    - [1. Solana wallet](#1-solana-wallet)
    - [2. Helius RPC](#2-helius-rpc)
@@ -128,31 +128,91 @@ If you want to see the signal quality firsthand, follow [@scg_alpha](https://x.c
 
 ## Prerequisites
 
-- **macOS or Linux** (Windows untested)
+- **macOS, Linux, or Windows via WSL2 Ubuntu** (native Windows shell is not supported)
 - **Node.js 20+** ([install via nvm](https://github.com/nvm-sh/nvm))
 - **A funded Solana wallet** (for live trading) — needs SOL for both trades and gas
 - **Accounts for:** Helius, Jupiter, SCG Alpha, Telegram, OKX (free), and optionally MiniMax (paid)
 
 ---
 
-## Quick start — the setup wizard (recommended)
+## Quick start — one-command onboarding
 
-There's an interactive CLI wizard that walks you through every credential, validates the services it can check live, **auto-detects your Telegram chat_id**, and can generate a fresh Solana keypair for you. It's the fastest path from `git clone` to a running bot.
+If someone handed you this repo and said "get MoonBags running", start here. The installer is meant to be the friendly path: it installs dependencies, installs OKX OnchainOS, runs the setup wizard, and finishes with a health check.
+
+From a fresh machine:
 
 ```bash
-# 1. Clone and install
-git clone <your-fork-url> moonbags
-cd moonbags
-npm install
-
-# 2. Install the OKX onchainos CLI (provides on-chain data)
-npm run install:onchainos
-
-# 3. Run the wizard
-npm run setup
+curl -fsSL https://raw.githubusercontent.com/fciaf420/moonbags/main/install.sh | bash
 ```
 
-The wizard walks through:
+If you already cloned the repo and are inside it:
+
+```bash
+MOONBAGS_DIR="$PWD" bash install.sh
+```
+
+If your checkout does not include `install.sh` yet, run the same steps manually:
+
+```bash
+npm install
+npm run install:onchainos
+npm run setup
+npm run doctor
+```
+
+What the installer covers:
+
+| Step | What happens |
+|------|--------------|
+| Install app packages | Runs `npm install` in the project. |
+| Install OKX OnchainOS | Runs `npm run install:onchainos`, which calls OKX's official installer. |
+| Set up credentials | Runs the interactive setup wizard and writes `.env` after confirmation. |
+| Check the install | Runs `npm run doctor` so you can fix missing keys, PATH issues, or service problems before trading. |
+
+After the installer finishes, open Telegram and send these to your bot:
+
+```text
+/doctor
+/setup_status
+/start
+```
+
+- `/doctor` checks the bot from Telegram: wallet, RPC, Jupiter, OKX OnchainOS, Telegram, and common runtime problems.
+- `/setup_status` shows what is complete and what still needs attention.
+- `/start` confirms the bot is online and shows the main dashboard.
+
+Keep `DRY_RUN=true` until `/doctor` and `/setup_status` are clean and you are comfortable with the alerts.
+
+### Start the bot
+
+For a first dry run:
+
+```bash
+npm run start
+```
+
+For a long-running install, use `pm2`:
+
+```bash
+npm install -g pm2
+pm2 start "npm run start" --name moonbags
+pm2 logs moonbags
+pm2 save
+```
+
+Useful restart commands:
+
+```bash
+pm2 restart moonbags
+pm2 restart moonbags --update-env   # use after changing .env
+pm2 logs moonbags
+```
+
+Once `pm2` is running, Telegram `/update` becomes the self-healing update path: it checks `origin/main`, shows incoming commits, refuses unsafe local changes, runs `npm install` when package files changed, and restarts `moonbags` with `pm2`.
+
+### What the setup wizard asks for
+
+The wizard walks through every credential, validates the services it can check live, auto-detects your Telegram `chat_id`, and can generate a fresh Solana keypair for you.
 
 | Step | What it does |
 |------|--------------|
@@ -171,13 +231,10 @@ The wizard never writes anything until the final confirmation step, and any exis
 After the wizard finishes:
 
 ```bash
-# Start the bot
-npx tsx src/main.ts
-
 # Open the dashboard
 open http://localhost:8787/
 
-# Control from Telegram — message your bot with:
+# Control from Telegram:
 /start
 ```
 
@@ -238,11 +295,29 @@ This is a **compiled Rust binary** (npm package) that wraps OKX's on-chain data 
 npm run install:onchainos
 ```
 
-The installer places the `onchainos` binary on your user PATH, commonly under `~/.local/bin`. If `which onchainos` still returns nothing, open a new terminal or add that directory to your shell PATH.
+That command runs OKX's official installer:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/okx/onchainos-skills/main/install.sh | sh
+```
+
+The installer places the `onchainos` binary on your user PATH, commonly under `~/.local/bin`. If `which onchainos` still returns nothing, open a new terminal or add that directory to your shell PATH:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+```
+
+Then restart the bot so it picks up the PATH:
+
+```bash
+pm2 restart moonbags --update-env
+```
 
 Verify it works:
 
 ```bash
+which onchainos
 onchainos --version
 onchainos token trending --help
 onchainos market price --address So11111111111111111111111111111111111111112 --chain solana
@@ -470,6 +545,8 @@ Every command is gated to the `TELEGRAM_CHAT_ID` in `.env` — random users who 
 | `/mint <mint>` | On-demand on-chain snapshot for any token: price + 5m/1h/4h/24h % changes, smart money / bundler / dev flow, top-10 holder PnL, dev hold %, LP burn, GMGN link. |
 | `/wallet` | Full wallet address + SOL balance + Solscan link. |
 | `/backtest` | Run a live backtest on 100 trending Solana tokens (~60s). Shows top 5 ARM/TRAIL/STOP combos vs your current config. Tap a row to **adopt** — settings save to `.env` and apply on the next tick, no restart needed. |
+| `/doctor` | Run a health check from Telegram. Use this when the bot starts, after changing `.env`, or when something feels off. Mirrors `npm run doctor`. |
+| `/setup_status` | Show a plain-English setup checklist: credentials, wallet, Telegram, OKX OnchainOS, and remaining fixes. |
 | `/update` | Check `origin/main`, show incoming commits, then pull + restart through `pm2` after confirmation. Requires `git` and a `pm2` process named `moonbags`. |
 
 ### Notification behaviour
@@ -655,10 +732,12 @@ The bot writes to `state/` in the project directory:
 
 ### Normal flow
 
-1. Check `/start` in Telegram for current SOL balance + open positions.
-2. Receive buy/arm/sell notifications as they happen.
-3. If something looks off in a position, tap the Sell button in `/positions`.
-4. Run `/pnl` at the end of the day for a summary.
+1. Send `/doctor` after every install, update, or `.env` change.
+2. Send `/setup_status` if `/doctor` reports anything missing.
+3. Check `/start` for current SOL balance + open positions.
+4. Receive buy/arm/sell notifications as they happen.
+5. If something looks off in a position, tap the Sell button in `/positions`.
+6. Run `/pnl` at the end of the day for a summary.
 
 ### Tuning settings
 
@@ -682,15 +761,16 @@ Sells every open position immediately via Jupiter. Confirms with a summary messa
 
 ```bash
 pm2 restart moonbags
+pm2 restart moonbags --update-env   # after .env or PATH changes
 # or
 sudo systemctl restart moonbags
 ```
 
 State is preserved. Positions in flight at the moment of restart are reconciled from your wallet balance and logged to `state/stranded.json`.
 
-### Updating from Telegram
+### Self-healing updates from Telegram
 
-If the bot is running under `pm2`, `/update` can pull the latest `origin/main` and restart the bot for you:
+If the bot is running under `pm2`, `/update` can pull the latest `origin/main`, refresh packages when needed, and restart the bot for you:
 
 ```bash
 npm install -g pm2
@@ -699,6 +779,8 @@ pm2 save
 ```
 
 Then send `/update` in Telegram. The bot checks for `git`, refuses to update when the working tree has local edits or local-only commits, shows incoming commits, warns when positions are open, and requires a confirm tap before running `git pull --ff-only origin main`. If `package.json` or `package-lock.json` changed, it runs `npm install` before `pm2 restart moonbags --update-env`.
+
+After the restart, send `/doctor` and `/setup_status` to confirm the bot came back healthy.
 
 ---
 
@@ -767,42 +849,29 @@ Useful for manually evaluating a token before whitelisting it, or debugging why 
 
 ## Troubleshooting
 
-### `[priceFeed] okx prices failed`
+See [TROUBLESHOOTING.md](./TROUBLESHOOTING.md) for the practical recovery guide.
 
-The `onchainos` CLI is intermittently rate-limited or having auth issues. The bot **automatically falls back to Jupiter Ultra sell quotes** for affected tokens — no action needed. If it persists for >5 minutes, check:
-
-- Is `onchainos --version` working from the shell?
-- If `/backtest` says `unrecognized subcommand 'trending'`, update the CLI with `npm run install:onchainos`, then restart the bot. `onchainos 2.1.0` supports `token trending`.
-- Are you on IPv4? `onchainos` does NOT support IPv6. Run `curl -6 -s https://ipv6.icanhazip.com || curl -s https://ipv4.icanhazip.com` — if you get an IPv6 response, disable IPv6 on your network interface.
-
-### `MINIMAX_API_KEY missing — skipping LLM consult`
-
-You set `LLM_EXIT_ENABLED=true` but no API key. Either:
-- Add `MINIMAX_API_KEY=...` to `.env` and restart, OR
-- Run `/llm` in Telegram to toggle it back off.
-
-### `Buy failed`
-
-Common causes:
-- Insufficient SOL in wallet for `BUY_SIZE_SOL` + fees.
-- Token has no liquidity yet (alert fired too early).
-- Slippage exceeded — the bot retries with the next alert; nothing to do.
-
-### `Sell stuck`
-
-After 10 retries, the bot gives up and sends a `SELL STUCK` alert. Use `/positions` → tap the Sell button to retry manually, or sell directly via your wallet if needed.
-
-### Bot stopped responding to Telegram
+Fast checks:
 
 ```bash
-pm2 restart moonbags    # or systemctl restart
+npm run doctor
+pm2 restart moonbags --update-env
+pm2 logs moonbags
 ```
 
-The polling loop is robust but a network blip can occasionally stall it. Restart resolves.
+Telegram checks:
 
-### Lost trades in `/pnl`
+```text
+/doctor
+/setup_status
+```
 
-Closed trades are logged to `state/closed.json`. If the file was corrupted or deleted, history is gone. The bot continues to track `realizedPnlSol` in `state/positions.json` (which persists across restarts).
+Common fixes:
+
+- OnchainOS missing: `npm run install:onchainos`, then reopen terminal or add `~/.local/bin` to PATH.
+- Bot running under old env: `pm2 restart moonbags --update-env`.
+- Telegram quiet: send `/doctor`, then `/setup_status`, then check `pm2 logs moonbags`.
+- Need latest version: send `/update` in Telegram after `pm2` is set up.
 
 ---
 
