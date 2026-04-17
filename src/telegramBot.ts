@@ -263,8 +263,14 @@ async function handleCallback(cq: NonNullable<Update["callback_query"]>): Promis
     return;
   }
 
-  if (data.startsWith("adopt:")) {
+  if (data.startsWith("confirm-adopt:")) {
     await tgPost("answerCallbackQuery", { callback_query_id: cq.id, text: "Applying..." });
+    await handleAdoptConfirmed(chatId, data);
+    return;
+  }
+
+  if (data.startsWith("adopt:")) {
+    await tgPost("answerCallbackQuery", { callback_query_id: cq.id });
     await handleAdopt(chatId, data);
     return;
   }
@@ -688,6 +694,9 @@ async function handleBacktest(chatId: number): Promise<void> {
   }
 }
 
+// First-tap handler — does NOT apply. Shows a side-by-side diff vs current
+// settings and asks for explicit confirmation. The confirm tap uses the
+// callback_data prefix `confirm-adopt:` to route to the actual apply path.
 async function handleAdopt(chatId: number, data: string): Promise<void> {
   // data = "adopt:arm:trail:stop" or "adopt:cancel"
   const parts = data.split(":");
@@ -700,6 +709,57 @@ async function handleAdopt(chatId: number, data: string): Promise<void> {
   const stop = parts[3];
   if (!arm || !trail || !stop) {
     await tgPost("sendMessage", { chat_id: chatId, text: "⚠️ Malformed adopt data." });
+    return;
+  }
+
+  const newArm = parseFloat(arm);
+  const newTrail = parseFloat(trail);
+  const newStop = parseFloat(stop);
+  const curArm = CONFIG.ARM_PCT;
+  const curTrail = CONFIG.TRAIL_PCT;
+  const curStop = CONFIG.STOP_PCT;
+
+  // Build a side-by-side diff so the user sees exactly what will change.
+  const diffRow = (label: string, cur: number, next: number): string => {
+    const unchanged = Math.abs(cur - next) < 0.001;
+    if (unchanged) {
+      return `${label.padEnd(6)}${(cur * 100).toFixed(0)}%  (unchanged)`;
+    }
+    const delta = (next - cur) * 100;
+    const arrow = delta >= 0 ? "↑" : "↓";
+    const sign = delta >= 0 ? "+" : "";
+    return `${label.padEnd(6)}${(cur * 100).toFixed(0)}% → <b>${(next * 100).toFixed(0)}%</b>  ${arrow} ${sign}${delta.toFixed(0)}%`;
+  };
+
+  await tgPost("sendMessage", {
+    chat_id: chatId,
+    text:
+      `⚠️ <b>Confirm adopt?</b>\n\n` +
+      `<pre>${escapeHtml(diffRow("ARM:", curArm, newArm))}\n` +
+      `${escapeHtml(diffRow("TRAIL:", curTrail, newTrail))}\n` +
+      `${escapeHtml(diffRow("STOP:", curStop, newStop))}</pre>\n` +
+      `Applies live, writes to .env. No restart needed.`,
+    parse_mode: "HTML",
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "✅ Yes, adopt", callback_data: `confirm-adopt:${arm}:${trail}:${stop}` }],
+        [{ text: "❌ Cancel", callback_data: "adopt:cancel" }],
+      ],
+    },
+  });
+}
+
+// Confirm tap — actually applies the settings. Fires setConfigValue for
+// each of ARM_PCT / TRAIL_PCT / STOP_PCT in sequence; partial failure is
+// surfaced per-field.
+async function handleAdoptConfirmed(chatId: number, data: string): Promise<void> {
+  // data = "confirm-adopt:arm:trail:stop"
+  const parts = data.split(":");
+  const arm = parts[1];
+  const trail = parts[2];
+  const stop = parts[3];
+  if (!arm || !trail || !stop) {
+    await tgPost("sendMessage", { chat_id: chatId, text: "⚠️ Malformed confirm-adopt data." });
     return;
   }
 
