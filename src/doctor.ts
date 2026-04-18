@@ -52,6 +52,20 @@ function hasValue(env: EnvMap, key: string): boolean {
   return Boolean(env[key]?.trim());
 }
 
+function envNumber(env: EnvMap, key: string): number | null {
+  if (!hasValue(env, key)) return null;
+  const value = Number(env[key]);
+  return Number.isFinite(value) ? value : null;
+}
+
+function envBool(env: EnvMap, key: string): boolean | null {
+  if (!hasValue(env, key)) return null;
+  const value = env[key]!.trim().toLowerCase();
+  if (["1", "true", "yes", "y", "on"].includes(value)) return true;
+  if (["0", "false", "no", "n", "off"].includes(value)) return false;
+  return null;
+}
+
 function firstLine(raw: string): string {
   return raw.split("\n").map((line) => line.trim()).find(Boolean) ?? "";
 }
@@ -144,6 +158,55 @@ function checkEnvVars(env: EnvMap): DoctorCheck[] {
     detail: telegramSet ? "set" : "missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID",
     fix: telegramSet ? undefined : "Run npm run setup after creating a bot with @BotFather.",
   });
+
+  const numericFilters = [
+    "MAX_ALERT_AGE_MINS",
+    "MIN_LIQUIDITY_USD",
+    "MIN_SCORE",
+    "MAX_RUG_RATIO",
+    "MAX_BUNDLER_PCT",
+    "MAX_TOP10_PCT",
+  ];
+  const invalidFilters = numericFilters.filter((key) => hasValue(env, key) && envNumber(env, key) === null);
+  if (invalidFilters.length > 0) {
+    checks.push({
+      id: "env:alert_filters",
+      label: "Entry alert filters",
+      status: "fail",
+      detail: `invalid numeric filter values: ${invalidFilters.join(", ")}`,
+      fix: "Use numbers for alert filters. Set them to 0 to disable filtering.",
+    });
+  } else {
+    const enabledFilters = numericFilters
+      .map((key) => [key, envNumber(env, key)] as const)
+      .filter(([, value]) => value !== null && value > 0)
+      .map(([key, value]) => `${key}=${value}`);
+    const risingLiq = envBool(env, "REQUIRE_RISING_LIQ");
+    if (risingLiq === null && hasValue(env, "REQUIRE_RISING_LIQ")) {
+      checks.push({
+        id: "env:alert_filters_bool",
+        label: "Entry alert filters",
+        status: "fail",
+        detail: "invalid REQUIRE_RISING_LIQ value",
+        fix: "Set REQUIRE_RISING_LIQ=true or false.",
+      });
+    } else if (enabledFilters.length > 0 || risingLiq === true) {
+      checks.push({
+        id: "env:alert_filters",
+        label: "Entry alert filters",
+        status: "warn",
+        detail: [...enabledFilters, ...(risingLiq === true ? ["REQUIRE_RISING_LIQ=true"] : [])].join(", "),
+        fix: "These filters can block entry signals. Set numeric filters to 0 and REQUIRE_RISING_LIQ=false for open SCG alerts.",
+      });
+    } else {
+      checks.push({
+        id: "env:alert_filters",
+        label: "Entry alert filters",
+        status: "ok",
+        detail: "open defaults (0 disables numeric filters)",
+      });
+    }
+  }
 
   return checks;
 }

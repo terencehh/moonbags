@@ -879,6 +879,7 @@ Common fixes:
 - OnchainOS missing: `npm run install:onchainos`, then reopen terminal or add `~/.local/bin` to PATH.
 - Bot running under old env: `pm2 restart moonbags --update-env`.
 - Telegram quiet: send `/doctor`, then `/setup_status`, then check `pm2 logs moonbags`.
+- No entry signals: send `/ping`. If it says the poller is alive but recent decisions are filtered, check `MAX_ALERT_AGE_MINS`, `MIN_LIQUIDITY_USD`, `MIN_SCORE`, and the other alert filters in `.env`. `0` disables each numeric filter.
 - Need latest version: send `/update` in Telegram after `pm2` is set up.
 
 ---

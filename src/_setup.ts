@@ -374,6 +374,13 @@ async function main(): Promise<void> {
   if (!existingEnv.match(/^SCG_POLL_MS=/m)) collected.SCG_POLL_MS = "3000";
   if (!existingEnv.match(/^PRICE_POLL_MS=/m)) collected.PRICE_POLL_MS = "3000";
   if (!existingEnv.match(/^SLIPPAGE_BPS=/m)) collected.SLIPPAGE_BPS = "2500";
+  if (!existingEnv.match(/^MAX_ALERT_AGE_MINS=/m)) collected.MAX_ALERT_AGE_MINS = "0";
+  if (!existingEnv.match(/^MIN_LIQUIDITY_USD=/m)) collected.MIN_LIQUIDITY_USD = "0";
+  if (!existingEnv.match(/^MIN_SCORE=/m)) collected.MIN_SCORE = "0";
+  if (!existingEnv.match(/^MAX_RUG_RATIO=/m)) collected.MAX_RUG_RATIO = "0";
+  if (!existingEnv.match(/^MAX_BUNDLER_PCT=/m)) collected.MAX_BUNDLER_PCT = "0";
+  if (!existingEnv.match(/^MAX_TOP10_PCT=/m)) collected.MAX_TOP10_PCT = "0";
+  if (!existingEnv.match(/^REQUIRE_RISING_LIQ=/m)) collected.REQUIRE_RISING_LIQ = "false";
 
   // 9. Write .env
   section("Writing .env", 9);

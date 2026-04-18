@@ -9,6 +9,7 @@ import {
   removeFromBlacklist,
   getBlacklist,
   getPollerHealth,
+  getRecentAlertEvents,
   hasSeenAlert,
   alertKey,
   SCG_URL,
@@ -626,6 +627,41 @@ function formatAgo(ms: number): string {
   return `${Math.round(ms / 3_600_000)}h ago`;
 }
 
+function formatRecentPollerDecisions(): string[] {
+  const events = getRecentAlertEvents();
+  if (events.length === 0) {
+    return ["• recent alert decisions: none yet (startup seeds existing alerts, then waits for new ones)"];
+  }
+
+  const recent = events.slice(-25);
+  const fired = recent.filter((e) => e.action === "fired").length;
+  const filtered = recent.filter((e) => e.action === "filtered").length;
+  const dedup = recent.filter((e) => e.action === "dedup").length;
+  const lines = [`• recent alert decisions: ${fired} fired · ${filtered} filtered · ${dedup} dedup`];
+
+  const latest = recent[recent.length - 1];
+  if (latest) {
+    const action = latest.action === "fired" ? "fired" : latest.action === "filtered" ? "filtered" : "deduped";
+    const reason = latest.reason ? ` — ${escapeHtml(latest.reason)}` : "";
+    lines.push(`• latest decision: ${action} <code>${escapeHtml(latest.name)}</code> ${formatAgo(Date.now() - latest.at)}${reason}`);
+  }
+
+  const reasonCounts = new Map<string, number>();
+  for (const event of recent) {
+    if (event.action !== "filtered" || !event.reason) continue;
+    reasonCounts.set(event.reason, (reasonCounts.get(event.reason) ?? 0) + 1);
+  }
+  const topReasons = [...reasonCounts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .map(([reason, count]) => `${count} ${escapeHtml(reason)}`);
+  if (topReasons.length > 0) {
+    lines.push(`• filter reasons: ${topReasons.join(" · ")}`);
+  }
+
+  return lines;
+}
+
 async function handlePing(chatId: number): Promise<void> {
   const lines: string[] = ["🩺 <b>Connectivity check</b>"];
 
@@ -675,6 +711,7 @@ async function handlePing(chatId: number): Promise<void> {
   const now = Date.now();
   const lastOkAgo = health.lastTickOkAt ? now - health.lastTickOkAt : Infinity;
   const paused = isPaused();
+  const pollerRecentlyOk = Number.isFinite(lastOkAgo) && lastOkAgo <= Math.max(CONFIG.SCG_POLL_MS * 2, 5_000);
 
   if (!upstreamOk) {
     lines.push("2. Poller processing: ⚠️ skipped (upstream unreachable)");
@@ -684,6 +721,11 @@ async function handlePing(chatId: number): Promise<void> {
     lines.push(
       `2. Poller processing: ✅ newest upstream alert is in dedup set` +
         (newestName ? ` (<code>${escapeHtml(newestName)}</code>, age ${newestAgeMins}m)` : ""),
+    );
+  } else if (pollerRecentlyOk && !health.lastTickError) {
+    lines.push(
+      `2. Poller processing: ⚠️ newest upstream alert is not seen yet — poller is alive and may be one tick behind` +
+        (newestName ? ` (<code>${escapeHtml(newestName)}</code>)` : ""),
     );
   } else {
     lines.push(
@@ -706,6 +748,7 @@ async function handlePing(chatId: number): Promise<void> {
   lines.push(`• dedup set size: ${health.seenSize}`);
   lines.push(`• paused: ${paused ? "🟡 yes — run /resume" : "no"}`);
   lines.push(`• blacklisted mints: ${getBlacklist().length}`);
+  lines.push(...formatRecentPollerDecisions());
   lines.push(
     `• runtime: node ${process.version} · ${process.platform}/${process.arch} · poll every ${CONFIG.SCG_POLL_MS}ms`,
   );
