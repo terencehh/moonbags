@@ -605,18 +605,23 @@ For each armed position, it gets a compact JSON payload with:
 - **Risk profile:** dev current holding %, dev sell status tag, LP burned %, top10 concentration, sniper status, token tags
 - **Recent signals:** smart money / KOL / whale movements scoped to this token (last 60 min)
 - **Klines:** 60 1m candles + 60 5m candles (closes + USD volumes)
+- **Deterministic evidence facts:** `bundlerDistribution`, `smartMoneySelling`, `topHolderCapitulation`, `volumeCliff`, `roundTripRisk`
+- **Memory:** recent same-position decisions, global closed-trade track record, and similar historical cases when the same evidence facts appeared
 
 ### What the LLM can decide
 
-Three actions only:
+Four actions:
 
 | Action | What happens |
 |--------|--------------|
 | `hold` | Nothing changes — current trail logic continues |
-| `tighten_trail` | Lowers trail % (e.g. 55% → 25%) — locks in more profit. Effective on next 3s tick. |
+| `set_trail` | Changes trail % up or down within the configured ceiling. Effective on next 3s tick. |
+| `partial_exit` | Sells 10-75% of the current position and leaves the remainder open. |
 | `exit_now` | Sells the entire position immediately, bypassing the trail |
 
-The LLM **cannot** buy more, partial-sell, loosen the trail, or override the hard stop.
+The LLM **cannot** buy more or override the hard stop. Aggressive actions are hard-gated: `partial_exit` and `exit_now` are blocked unless the deterministic evidence object allows them, and trail tightening is blocked unless at least two evidence facts are active. Every non-hold reason must cite exact fact keys.
+
+Each consult writes an audit record to `state/llm_audits/<mint>.json` with the exact prompt payload, evidence facts, similar-case memory, raw tool arguments, parsed decision, and gate result.
 
 ### Telegram notifications
 
@@ -627,6 +632,7 @@ Per-position lifecycle with LLM enabled:
 ⚡ ARMED YOLO — trailing active          ← PnL hits +50%
 🤖 LLM watching YOLO                     ← LLM picks up the position (once)
 🤖 LLM tightened YOLO  55% → 25%         ← only on actual change
+💰 LLM partial YOLO sold 30%             ← only when evidence gate allows
 🟢 SELL YOLO — llm                       ← exit triggered
    PnL: +0.084 SOL (+420.0%)
    peak: +680.5%  |  held: 8m 12s
@@ -798,7 +804,7 @@ Two scripts ship with the bot for tuning your trading params and researching ind
 
 ### SCG alert backtester — `src/_backtest.ts`
 
-Fetches the current SCG Alpha alert window, saves a snapshot to `state/backtests/`, then uses each alert's `alert_time` as the simulated entry. It pulls OHLCV after that signal and requires roughly 24 hours of post-signal runway before a token is eligible for the recommendation. The backtester compares deterministic exit modes that Telegram can adopt live:
+Fetches the current SCG Alpha alert window, saves a snapshot to `state/backtests/`, then uses each alert's `alert_time` plus `alert_mcap` as the simulated entry when SCG provides enough data to derive supply. If `alert_mcap` cannot be anchored, it falls back to the first usable post-signal candle. It pulls OHLCV after that signal and requires roughly 24 hours of post-signal runway before a token is eligible for the recommendation. The backtester compares deterministic exit modes that Telegram can adopt live:
 
 - **Trail** — arm, trailing drawdown, hard stop.
 - **Fixed TP** — sell the whole position at a fixed take-profit percent.
@@ -841,6 +847,7 @@ npx tsx src/_backtest.ts --bar 5m --top 25 --source scg
 - **AVG/TRADE** — average % per trade
 - **W / L / H** — wins / losses / still-holding (trade hit neither stop nor trail by end of data)
 - **WIN%** — wins as % of completed trades (excluding holding)
+- **entries** — how many samples used SCG `alert_mcap` versus the first usable candle as the entry basis
 
 Telegram `/backtest` shows the same recommendation in chat and includes adopt buttons. Adopting saves to `state/settings.json`, switches the exit strategy if needed, and applies on the next position tick without a restart.
 

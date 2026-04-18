@@ -1090,7 +1090,7 @@ async function handleBacktest(chatId: number, argText: string = ""): Promise<voi
   const statusId = startMsg?.result?.message_id;
 
   try {
-    const { topResults, allResults, samplesUsed, tokensFetched, durationMs, source, resolutionCounts } = await runBacktest({
+    const { topResults, allResults, samplesUsed, tokensFetched, durationMs, source, resolutionCounts, entrySourceCounts } = await runBacktest({
       bar: "5m",
       topN: 5,
       minCandles: 60,
@@ -1172,9 +1172,12 @@ async function handleBacktest(chatId: number, argText: string = ""): Promise<voi
     const lines: string[] = [];
     lines.push(`🧪 <b>Backtest complete</b> (${mode})`);
     const resolutionText = Object.entries(resolutionCounts).map(([k, v]) => `${v} ${k}`).join(" · ") || "none";
-    lines.push(`<i>${samplesUsed}/${tokensFetched} SCG alerts · ${allResults.length} combos · ${Math.round(durationMs/1000)}s · OHLCV from signal time · ${resolutionText}</i>`);
+    const entryText = Object.entries(entrySourceCounts)
+      .map(([k, v]) => `${v} ${k === "alert_mcap" ? "alert mcap" : "first candle"}`)
+      .join(" · ") || "none";
+    lines.push(`<i>${samplesUsed}/${tokensFetched} SCG alerts · ${allResults.length} combos · ${Math.round(durationMs/1000)}s · OHLCV from signal time · ${resolutionText} · entries ${entryText}</i>`);
     lines.push("");
-    lines.push("Source: SCG alert_time entry, requiring usable post-signal OHLCV. 1m cannot cover 24h with the current 299-candle cap, so recommendations mostly use 5m/15m/1H.");
+    lines.push("Source: SCG alert_time + alert_mcap entry when available, requiring usable post-signal OHLCV. 1m cannot cover 24h with the current 299-candle cap, so recommendations mostly use 5m/15m/1H.");
     lines.push("");
     if (CONFIG.LLM_EXIT_ENABLED) {
       lines.push("⚠️ <b>LLM is ON</b> — LLM Managed is not modeled here. Adopting a deterministic result switches the exit strategy.");

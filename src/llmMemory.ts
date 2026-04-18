@@ -5,9 +5,10 @@
  *   - L2 (in-memory): ring buffer of recent PositionSnapshots + recent LLM
  *     decisions per mint. computeTrends() turns the snapshot ring into a
  *     compact trend-vector block that the user prompt embeds.
- *   - L3 (persisted):   state/llm_decisions.json — a shadow log written on
- *     every position close, capturing the full decision timeline + a
- *     post-mortem verdict. Not read back into prompts YET (shadow mode).
+ *   - L3 (persisted):   state/llm_decisions.json — a closed-trade log used
+ *     for track-record and similar-case injection.
+ *   - Audit trail:      state/llm_audits/<mint>.json — exact prompt payloads
+ *     and gate outcomes for post-mortem debugging.
  */
 
 import { readFile, writeFile, mkdir } from "node:fs/promises";
@@ -30,6 +31,14 @@ export type DecisionRecord = {
   reason: string;
   pnlPct: number;        // decimal at time of decision (e.g. 0.574)
   peakPnlPct: number;    // decimal
+  citedFacts?: string[];
+  evidenceKeys?: string[];
+  gate?: {
+    partialExitAllowed: boolean;
+    exitNowAllowed: boolean;
+    tightenAllowed: boolean;
+    blockedAction?: string;
+  };
 };
 
 const snapshotLog = new Map<string, SnapshotRecord[]>();
@@ -142,7 +151,9 @@ export function computeTrends(mint: string): TrendVectors | null {
 // ---------------------------------------------------------------------------
 const STATE_DIR = path.resolve("state");
 const DECISIONS_FILE = path.join(STATE_DIR, "llm_decisions.json");
+const AUDIT_DIR = path.join(STATE_DIR, "llm_audits");
 const MAX_RECORDS = 500;
+const MAX_AUDIT_RECORDS_PER_MINT = 50;
 
 export type LlmTradeRecord = {
   mint: string;
@@ -249,4 +260,51 @@ export async function readLlmTradeRecords(limit = 100): Promise<LlmTradeRecord[]
   } catch {
     return [];
   }
+}
+
+export type LlmPromptAuditRecord = {
+  at: number;
+  mint: string;
+  name: string;
+  context: Record<string, unknown>;
+  evidence: unknown;
+  similarCases: unknown;
+  payload: unknown;
+  userPrompt: string;
+  rawToolArguments?: string;
+  decision?: unknown;
+  gate?: unknown;
+  error?: string;
+  latencyMs?: number;
+};
+
+function auditFileForMint(mint: string): string {
+  const safe = mint.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 80);
+  return path.join(AUDIT_DIR, `${safe}.json`);
+}
+
+export async function appendLlmPromptAudit(rec: LlmPromptAuditRecord): Promise<void> {
+  chain = chain.then(async () => {
+    try {
+      await mkdir(AUDIT_DIR, { recursive: true });
+      const file = auditFileForMint(rec.mint);
+      let all: LlmPromptAuditRecord[] = [];
+      try {
+        const raw = await readFile(file, "utf8");
+        all = JSON.parse(raw) as LlmPromptAuditRecord[];
+      } catch {
+        /* first write */
+      }
+      all.push(rec);
+      if (all.length > MAX_AUDIT_RECORDS_PER_MINT) {
+        all = all.slice(-MAX_AUDIT_RECORDS_PER_MINT);
+      }
+      await writeFile(file, JSON.stringify(all, null, 2));
+    } catch (err) {
+      // Audit writes must never block trading.
+      // eslint-disable-next-line no-console
+      console.error("[llm-audit] append failed:", String(err));
+    }
+  });
+  return chain;
 }

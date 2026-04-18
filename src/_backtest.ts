@@ -78,8 +78,21 @@ const MIN_CANDLES_BY_BAR: Record<string, number> = {
 // ---------------------------------------------------------------------------
 interface Candle { ts: number; open: number; high: number; low: number; close: number }
 interface SimResult { exitPct: number; reason: "trail" | "stop" | "tp" | "holding" | "no_entry" }
-interface TokenSample { address: string; symbol: string; alertTimeSec?: number; source: "scg" | "hot" }
-interface CandleSample { symbol: string; candles: Candle[]; bar: string }
+interface TokenSample {
+  address: string;
+  symbol: string;
+  alertTimeSec?: number;
+  alertMcap?: number;
+  impliedSupply?: number;
+  source: "scg" | "hot";
+}
+interface CandleSample {
+  symbol: string;
+  candles: Candle[];
+  bar: string;
+  entryValue?: number;
+  entrySource: "alert_mcap" | "first_candle";
+}
 export type BacktestExitMode = "trail" | "fixed_tp" | "tp_ladder";
 export type BacktestTpTarget = { pnlPct: number; sellPct: number };
 interface GridResult {
@@ -192,6 +205,8 @@ async function fetchScgTokens(): Promise<TokenSample[]> {
       address: alert.mint,
       symbol: alert.name || alert.mint.slice(0, 6),
       alertTimeSec: alert.alert_time,
+      alertMcap: alert.alert_mcap,
+      impliedSupply: estimateSupplyFromAlert(alert),
       source: "scg",
     });
   }
@@ -199,6 +214,15 @@ async function fetchScgTokens(): Promise<TokenSample[]> {
   if (tokens.length === 0) throw new Error("SCG alerts returned no tokens");
   await saveScgSnapshot(alerts).catch(() => undefined);
   return tokens;
+}
+
+function estimateSupplyFromAlert(alert: ScgAlertsResponse["alerts"][number]): number | undefined {
+  const supplies = Object.values(alert.tracked_prices ?? {})
+    .map((tracked) => tracked.price > 0 && tracked.mcap > 0 ? tracked.mcap / tracked.price : NaN)
+    .filter((value) => Number.isFinite(value) && value > 0)
+    .sort((a, b) => a - b);
+  if (supplies.length === 0) return undefined;
+  return supplies[Math.floor(supplies.length / 2)];
 }
 
 async function saveScgSnapshot(alerts: ScgAlertsResponse["alerts"]): Promise<void> {
@@ -234,7 +258,9 @@ function minCandlesForBar(bar: string, configuredMin: number, source: "scg" | "h
 async function fetchSampleCandles(token: TokenSample, preferredBar: string, configuredMin: number): Promise<CandleSample | null> {
   if (token.source !== "scg") {
     const candles = await fetchKlines(token.address, preferredBar);
-    return candles.length >= configuredMin ? { symbol: token.symbol, candles, bar: preferredBar } : null;
+    return candles.length >= configuredMin
+      ? { symbol: token.symbol, candles, bar: preferredBar, entrySource: "first_candle" }
+      : null;
   }
 
   const bars = Array.from(new Set([preferredBar, ...SCG_BAR_PRIORITY]));
@@ -242,17 +268,36 @@ async function fetchSampleCandles(token: TokenSample, preferredBar: string, conf
   const eager = await Promise.all(eagerBars.map(async (bar) => ({ bar, candles: candlesAfterAlert(await fetchKlines(token.address, bar), token.alertTimeSec) })));
   for (const sample of eager) {
     if (sample.candles.length >= minCandlesForBar(sample.bar, configuredMin, token.source) && hasRunway(sample.candles, token.alertTimeSec)) {
-      return { symbol: token.symbol, candles: sample.candles, bar: sample.bar };
+      return buildCandleSample(token, sample.candles, sample.bar);
     }
   }
 
   for (const bar of bars.slice(2)) {
     const candles = candlesAfterAlert(await fetchKlines(token.address, bar), token.alertTimeSec);
     if (candles.length >= minCandlesForBar(bar, configuredMin, token.source) && hasRunway(candles, token.alertTimeSec)) {
-      return { symbol: token.symbol, candles, bar };
+      return buildCandleSample(token, candles, bar);
     }
   }
   return null;
+}
+
+function buildCandleSample(token: TokenSample, candles: Candle[], bar: string): CandleSample {
+  if (token.alertMcap && token.alertMcap > 0 && token.impliedSupply && token.impliedSupply > 0) {
+    return {
+      symbol: token.symbol,
+      candles: candles.map((c) => ({
+        ts: c.ts,
+        open: c.open * token.impliedSupply!,
+        high: c.high * token.impliedSupply!,
+        low: c.low * token.impliedSupply!,
+        close: c.close * token.impliedSupply!,
+      })),
+      bar,
+      entryValue: token.alertMcap,
+      entrySource: "alert_mcap",
+    };
+  }
+  return { symbol: token.symbol, candles, bar, entrySource: "first_candle" };
 }
 
 // ---------------------------------------------------------------------------
@@ -287,7 +332,8 @@ async function fetchKlines(address: string, bar: string = BAR): Promise<Candle[]
 
 // ---------------------------------------------------------------------------
 // Simulate one trade with given params.
-// Entry = first candle open. Supports partial scale-out and moonbag.
+// Entry = SCG alert market cap when available, otherwise first candle open.
+// Supports partial scale-out and moonbag.
 // ---------------------------------------------------------------------------
 // NOTE on entry timing:
 //   We don't replicate SCG's upstream filter (we don't know exactly what it is),
@@ -308,10 +354,11 @@ function simulate(
   strategyMode: BacktestExitMode = "trail",
   ladderTargets: BacktestTpTarget[] = [],
   trailRemainder = true,
+  entryValue?: number,
 ): SimResult {
   const firstCandle = candles[0];
   if (!firstCandle) return { exitPct: 0, reason: "no_entry" };
-  const rawEntry = firstCandle.open;
+  const rawEntry = entryValue && entryValue > 0 ? entryValue : firstCandle.open;
   if (!rawEntry || rawEntry <= 0) return { exitPct: 0, reason: "no_entry" };
 
   // Apply fee + slippage haircut: each swap costs (FEE_BPS + SLIPPAGE_BPS)/10000
@@ -468,6 +515,7 @@ export interface RunBacktestResult {
   bar: string;
   source: "scg" | "hot";
   resolutionCounts: Record<string, number>;
+  entrySourceCounts: Record<string, number>;
   durationMs: number;
 }
 
@@ -508,6 +556,10 @@ export async function runBacktest(opts: RunBacktestOptions = {}): Promise<RunBac
     acc[sample.bar] = (acc[sample.bar] ?? 0) + 1;
     return acc;
   }, {});
+  const entrySourceCounts = samples.reduce<Record<string, number>>((acc, sample) => {
+    acc[sample.entrySource] = (acc[sample.entrySource] ?? 0) + 1;
+    return acc;
+  }, {});
   if (samples.length === 0) {
     return {
       samplesUsed: 0,
@@ -517,6 +569,7 @@ export async function runBacktest(opts: RunBacktestOptions = {}): Promise<RunBac
       bar,
       source,
       resolutionCounts,
+      entrySourceCounts,
       durationMs: Date.now() - start,
     };
   }
@@ -654,6 +707,7 @@ export async function runBacktest(opts: RunBacktestOptions = {}): Promise<RunBac
         combo.mbPct, combo.mbTrail, combo.mbTimeout * 60_000,
         0, combo.fixedTargetPct,
         combo.strategyMode, combo.ladderTargets, combo.trailRemainder,
+        s.entryValue,
       );
       if (sim.reason === "no_entry") { noEntry++; continue; }
       if (sim.reason === "holding") { holding++; continue; } // exclude from PnL totals
@@ -702,6 +756,7 @@ export async function runBacktest(opts: RunBacktestOptions = {}): Promise<RunBac
     bar,
     source,
     resolutionCounts,
+    entrySourceCounts,
     durationMs: Date.now() - start,
   };
 }
@@ -723,7 +778,10 @@ async function main(): Promise<void> {
       tokenLimit: TOKEN_LIMIT > 0 ? TOKEN_LIMIT : undefined,
     });
     const resolutionText = Object.entries(result.resolutionCounts).map(([bar, count]) => `${count} ${bar}`).join(" · ") || "none";
-    console.log(`Source: ${result.source} | usable samples: ${result.samplesUsed}/${result.tokensFetched} | OHLCV: ${resolutionText}`);
+    const entryText = Object.entries(result.entrySourceCounts)
+      .map(([entrySource, count]) => `${count} ${entrySource}`)
+      .join(" · ") || "none";
+    console.log(`Source: ${result.source} | usable samples: ${result.samplesUsed}/${result.tokensFetched} | OHLCV: ${resolutionText} | entries: ${entryText}`);
     console.log("LLM Managed is not modeled; deterministic exits only.\n");
     for (const [idx, r] of result.topResults.entries()) {
       const winPct = ((r.wins / (r.wins + r.losses || 1)) * 100).toFixed(0);

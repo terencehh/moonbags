@@ -154,6 +154,8 @@ export type TradeWindow = {
   sellVolumeSol: number;
   netFlowSol: number;     // buys - sells in SOL (positive = accumulating)
   uniqueWallets: number;
+  uniqueBuyers: number;
+  uniqueSellers: number;
 };
 
 export type TopHoldersSnapshot = {
@@ -292,6 +294,8 @@ async function getTradesByTag(
   const cutoff = Date.now() - withinMins * 60_000;
   const trades: TradeRecord[] = [];
   const wallets = new Set<string>();
+  const buyWallets = new Set<string>();
+  const sellWallets = new Set<string>();
   let buys = 0, sells = 0, buyVolumeSol = 0, sellVolumeSol = 0;
 
   for (const r of raw as Array<{
@@ -308,8 +312,15 @@ async function getTradesByTag(
     };
     trades.push(t);
     wallets.add(r.userAddress);
-    if (t.type === "buy") { buys++; buyVolumeSol += t.volumeSol; }
-    else                   { sells++; sellVolumeSol += t.volumeSol; }
+    if (t.type === "buy") {
+      buys++;
+      buyVolumeSol += t.volumeSol;
+      buyWallets.add(r.userAddress);
+    } else {
+      sells++;
+      sellVolumeSol += t.volumeSol;
+      sellWallets.add(r.userAddress);
+    }
   }
 
   return {
@@ -319,6 +330,8 @@ async function getTradesByTag(
     buyVolumeSol, sellVolumeSol,
     netFlowSol: buyVolumeSol - sellVolumeSol,
     uniqueWallets: wallets.size,
+    uniqueBuyers: buyWallets.size,
+    uniqueSellers: sellWallets.size,
   };
 }
 

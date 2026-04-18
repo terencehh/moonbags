@@ -35,6 +35,7 @@ import type {
 import {
   recordSnapshot,
   recordDecision,
+  appendLlmPromptAudit,
   getDecisions,
   computeTrends,
   readLlmTradeRecords,
@@ -47,6 +48,9 @@ import {
 export type LlmDecision = {
   action: "hold" | "exit_now" | "set_trail" | "partial_exit";
   reason: string;
+  citedFacts?: EvidenceKey[];
+  evidenceKeys?: EvidenceKey[];
+  gate?: EvidenceGate;
   newTrailPct?: number;
   // For partial_exit: fraction of CURRENT tokensHeld to sell (0.10 – 0.75).
   // The remaining position stays open with its existing trail/stop/LLM coverage.
@@ -64,6 +68,37 @@ export type LlmContext = {
   currentTrailPct: number;
   ceilingTrailPct: number;       // CONFIG.TRAIL_PCT — max trail the LLM may set
   holdSecs: number;
+};
+
+const EVIDENCE_KEYS = [
+  "bundlerDistribution",
+  "smartMoneySelling",
+  "topHolderCapitulation",
+  "volumeCliff",
+  "roundTripRisk",
+] as const;
+
+type EvidenceKey = typeof EVIDENCE_KEYS[number];
+
+type EvidenceFact = {
+  key: EvidenceKey;
+  active: boolean;
+  detail: string;
+  metrics: Record<string, number | string | boolean | null>;
+};
+
+type EvidenceGate = {
+  activeBearishKeys: EvidenceKey[];
+  partialExitAllowed: boolean;
+  exitNowAllowed: boolean;
+  tightenAllowed: boolean;
+  reasons: string[];
+  blockedAction?: "partial_exit" | "exit_now" | "set_trail";
+};
+
+type EvidencePacket = {
+  facts: Record<EvidenceKey, EvidenceFact>;
+  gate: EvidenceGate;
 };
 
 // ---------------------------------------------------------------------------
@@ -92,6 +127,10 @@ For each open position you are given:
     smart-money / bundler / dev / whale / insider trade windows, top-10
     holders' avg PnL and trend, liquidity pools, token risk profile, recent
     smart-money signals, and a compact 1m + 5m kline summary.
+  - an \`evidence\` block of deterministic facts. Treat this as the source of
+    truth for aggressive actions. The exact fact keys are:
+    \`bundlerDistribution\`, \`smartMoneySelling\`, \`topHolderCapitulation\`,
+    \`volumeCliff\`, and \`roundTripRisk\`.
   - a \`trends\` block showing how each signal has EVOLVED over the last ~5
     snapshots (oldest → newest, spanning ~2 minutes). Use it to distinguish:
       * ACCELERATING bullish (smart money + volume both climbing): don't tighten
@@ -117,6 +156,13 @@ Position prices (entryPriceSol/currentPriceSol) are denominated in SOL per
 token. The token's USD price lives in snapshot.momentum.priceUsd. Do not
 compare these directly without converting.
 
+Trade-window wording discipline:
+  - netFlowSol is buyVolumeSol - sellVolumeSol. Negative means net selling;
+    positive means net buying.
+  - uniqueWallets is all active tagged wallets. Use uniqueSellers when making
+    claims about "unique sellers" and uniqueBuyers for "unique buyers".
+  - Do not call smart money "silent" if buys, sells, or netFlowSol are non-zero.
+
 Your job is to choose ONE of four actions:
   - "hold"          — leave the existing trailing stop alone
   - "set_trail"     — change the trail % in either direction. new_trail_pct must
@@ -129,6 +175,10 @@ Your job is to choose ONE of four actions:
                       on a runner while staying exposed for more upside.
   - "exit_now"      — sell the entire position immediately
 
+You MUST cite exact evidence fact keys in cited_facts and in the reason text.
+Example: "Facts: bundlerDistribution, volumeCliff." If the evidence gate says
+partialExitAllowed or exitNowAllowed is false, you must not choose that action.
+
 EXIT PHILOSOPHY — DEFAULT ACTION IS HOLD.
 
 Your job is to identify the MINORITY of cases where action is warranted.
@@ -139,7 +189,7 @@ to refine it in EXCEPTIONAL cases, not improve it in average ones.
 
 Tighten (set_trail with new_trail_pct < current) ONLY if ≥2 of these
 converge (single signals are noise):
-  - Smart money net-SELLING AND wallet count > 3 unique sellers
+  - Smart money net-SELLING AND uniqueSellers > 3
   - Dev holding > 0% AND dev trade window shows sells
   - Bundlers net-SELLING over 30 min AND top holders capitulating
     (topHolders.averagePnlUsd << 0 and trending sell)
@@ -196,7 +246,8 @@ When to use partial_exit (the runner-capture tool):
 
 Output: you MUST respond by calling the submit_decision tool. Do not write
 prose. The "reason" field is shown to the user in Telegram — keep it to
-1-2 sentences and reference the specific on-chain cue you used.`;
+1-2 sentences and reference the specific on-chain cue you used. Include
+"Facts: ..." with the exact evidence keys you relied on.`;
 
 // ---------------------------------------------------------------------------
 // Tool schema (OpenAI / MiniMax compatible)
@@ -219,7 +270,16 @@ const SUBMIT_DECISION_TOOL = {
         reason: {
           type: "string",
           description:
-            "1-2 sentences explaining the decision, referencing the specific on-chain cue. Shown to the user in Telegram.",
+            "1-2 sentences explaining the decision, referencing the specific on-chain cue. Must include exact evidence keys, e.g. 'Facts: bundlerDistribution, volumeCliff.' Shown to the user in Telegram.",
+        },
+        cited_facts: {
+          type: "array",
+          items: {
+            type: "string",
+            enum: [...EVIDENCE_KEYS],
+          },
+          description:
+            "Exact deterministic evidence fact keys relied on for this decision. Use only these keys: bundlerDistribution, smartMoneySelling, topHolderCapitulation, volumeCliff, roundTripRisk.",
         },
         new_trail_pct: {
           type: "number",
@@ -232,7 +292,7 @@ const SUBMIT_DECISION_TOOL = {
             "REQUIRED only when action = partial_exit. Decimal in [0.10, 0.75]: fraction of CURRENT tokensHeld to sell. The remaining position stays open and keeps running. For >0.75, use exit_now instead. Typical values: 0.25-0.50 to lock profit on a running winner.",
         },
       },
-      required: ["action", "reason"],
+      required: ["action", "reason", "cited_facts"],
     },
   },
 };
@@ -278,6 +338,8 @@ function summarizeWindow(w: TradeWindow): unknown {
     sellVolumeSol: fmtNum(w.sellVolumeSol, 4),
     netFlowSol: fmtNum(w.netFlowSol, 4),
     uniqueWallets: w.uniqueWallets,
+    uniqueBuyers: w.uniqueBuyers,
+    uniqueSellers: w.uniqueSellers,
   };
 }
 
@@ -362,6 +424,155 @@ function summarizeKline(candles: Candle[], bar: string, keep: number): unknown {
   };
 }
 
+function fact(
+  key: EvidenceKey,
+  active: boolean,
+  detail: string,
+  metrics: EvidenceFact["metrics"],
+): EvidenceFact {
+  return { key, active, detail, metrics };
+}
+
+function computeEvidence(ctx: LlmContext, snapshot: PositionSnapshot): EvidencePacket {
+  const bundlers = snapshot.bundlers;
+  const smartMoney = snapshot.smartMoney;
+  const holders = snapshot.topHolders;
+  const momentum = snapshot.momentum;
+
+  const bundlerSellRatio = bundlers.buyVolumeSol > 0
+    ? bundlers.sellVolumeSol / bundlers.buyVolumeSol
+    : (bundlers.sellVolumeSol > 0 ? 999 : 0);
+  const bundlerDistribution =
+    bundlers.netFlowSol <= -50 &&
+    bundlers.sellVolumeSol >= 50 &&
+    bundlerSellRatio >= 1.5 &&
+    bundlers.uniqueSellers >= 3;
+
+  const smartMoneySelling =
+    smartMoney.netFlowSol <= -25 &&
+    smartMoney.sellVolumeSol >= 10 &&
+    smartMoney.uniqueSellers > 3;
+
+  const holderTrend = (holders?.trendType ?? []).map((t) => t.toLowerCase());
+  const topHolderCapitulation =
+    Boolean(holders) &&
+    (holders?.averagePnlUsd ?? 0) < -100 &&
+    holderTrend.some((t) => t.includes("sell"));
+
+  const volumeCliffThreshold = momentum ? momentum.volume1h / 20 : 0;
+  const volumeCliff =
+    Boolean(momentum) &&
+    (momentum?.volume1h ?? 0) > 0 &&
+    (momentum?.volume5m ?? 0) < volumeCliffThreshold;
+
+  const roundTripRisk =
+    ctx.peakPnlPct >= 0.5 &&
+    ctx.pnlPct <= 0.1 &&
+    ctx.drawdownFromPeakPct >= Math.min(0.5, Math.max(0.25, ctx.currentTrailPct * 0.75));
+
+  const facts: Record<EvidenceKey, EvidenceFact> = {
+    bundlerDistribution: fact(
+      "bundlerDistribution",
+      bundlerDistribution,
+      bundlerDistribution
+        ? "Bundler-tagged wallets are net selling with enough seller breadth and sell/buy imbalance."
+        : "Bundler flow is not broad or imbalanced enough to count as deterministic distribution.",
+      {
+        netFlowSol: fmtNum(bundlers.netFlowSol, 4),
+        buyVolumeSol: fmtNum(bundlers.buyVolumeSol, 4),
+        sellVolumeSol: fmtNum(bundlers.sellVolumeSol, 4),
+        sellBuyRatio: fmtNum(bundlerSellRatio, 2),
+        uniqueBuyers: bundlers.uniqueBuyers,
+        uniqueSellers: bundlers.uniqueSellers,
+      },
+    ),
+    smartMoneySelling: fact(
+      "smartMoneySelling",
+      smartMoneySelling,
+      smartMoneySelling
+        ? "Smart-money-tagged wallets are net selling with more than three unique sellers."
+        : "Smart money is not net-selling with enough seller breadth.",
+      {
+        netFlowSol: fmtNum(smartMoney.netFlowSol, 4),
+        buyVolumeSol: fmtNum(smartMoney.buyVolumeSol, 4),
+        sellVolumeSol: fmtNum(smartMoney.sellVolumeSol, 4),
+        uniqueBuyers: smartMoney.uniqueBuyers,
+        uniqueSellers: smartMoney.uniqueSellers,
+      },
+    ),
+    topHolderCapitulation: fact(
+      "topHolderCapitulation",
+      topHolderCapitulation,
+      topHolderCapitulation
+        ? "Top holders are underwater and trend data shows selling."
+        : "Top holders are not both underwater and sell-trending.",
+      {
+        averagePnlUsd: fmtNum(holders?.averagePnlUsd ?? 0, 2),
+        trendType: holderTrend.join(",") || null,
+        holdingPercent: fmtNum(holders?.holdingPercent ?? 0, 2),
+      },
+    ),
+    volumeCliff: fact(
+      "volumeCliff",
+      volumeCliff,
+      volumeCliff
+        ? "5m volume is below one twentieth of 1h volume."
+        : "5m volume has not fallen below the deterministic volume-cliff threshold.",
+      {
+        volume5mUsd: fmtNum(momentum?.volume5m ?? 0, 0),
+        volume1hUsd: fmtNum(momentum?.volume1h ?? 0, 0),
+        thresholdUsd: fmtNum(volumeCliffThreshold, 0),
+      },
+    ),
+    roundTripRisk: fact(
+      "roundTripRisk",
+      roundTripRisk,
+      roundTripRisk
+        ? "This was a meaningful winner and is now near flat/negative after a large peak drawdown."
+        : "The trade has not met the deterministic round-trip-risk pattern.",
+      {
+        pnlPct: fmtNum(ctx.pnlPct * 100, 2),
+        peakPnlPct: fmtNum(ctx.peakPnlPct * 100, 2),
+        drawdownFromPeakPct: fmtNum(ctx.drawdownFromPeakPct * 100, 2),
+        currentTrailPct: fmtNum(ctx.currentTrailPct * 100, 2),
+      },
+    ),
+  };
+
+  const activeBearishKeys = EVIDENCE_KEYS.filter((key) => facts[key].active);
+  const activeCount = activeBearishKeys.length;
+  const partialExitAllowed =
+    ctx.peakPnlPct >= 1 &&
+    activeCount >= 2 &&
+    (facts.bundlerDistribution.active || facts.volumeCliff.active || facts.roundTripRisk.active);
+  const exitNowAllowed =
+    activeCount >= 3 ||
+    (facts.roundTripRisk.active && activeCount >= 2 && ctx.pnlPct <= 0.1);
+  const tightenAllowed = activeCount >= 2;
+
+  const reasons: string[] = [];
+  if (!partialExitAllowed) {
+    reasons.push("partial_exit requires peakPnlPct >= +100% and at least two active evidence facts.");
+  }
+  if (!exitNowAllowed) {
+    reasons.push("exit_now requires at least three active evidence facts, or roundTripRisk plus another active fact near flat PnL.");
+  }
+  if (!tightenAllowed) {
+    reasons.push("tightening requires at least two active evidence facts.");
+  }
+
+  return {
+    facts,
+    gate: {
+      activeBearishKeys,
+      partialExitAllowed,
+      exitNowAllowed,
+      tightenAllowed,
+      reasons,
+    },
+  };
+}
+
 function compactSnapshot(snapshot: PositionSnapshot): unknown {
   return {
     momentum: summarizeMomentum(snapshot.momentum),
@@ -442,6 +653,28 @@ type TrackRecordSummary = {
   histogram: Record<string, number>;
 };
 
+type SimilarCaseSummary = {
+  totalMatched: number;
+  activeEvidenceKeys: EvidenceKey[];
+  cases: Array<{
+    name: string;
+    verdict: string;
+    evidenceKeys: EvidenceKey[];
+    peakPnlPct: number;
+    exitPnlPct: number;
+    exitReason: string;
+    lastAction: string | null;
+    lesson: string;
+  }>;
+};
+
+type PromptBuild = {
+  payload: Record<string, unknown>;
+  userPrompt: string;
+  evidence: EvidencePacket;
+  similarCases: SimilarCaseSummary | null;
+};
+
 async function buildTrackRecord(): Promise<TrackRecordSummary | null> {
   const records = await readLlmTradeRecords(200).catch(() => []);
   if (records.length < TRACK_RECORD_THRESHOLD) return null;
@@ -452,8 +685,106 @@ async function buildTrackRecord(): Promise<TrackRecordSummary | null> {
   return { total: records.length, histogram };
 }
 
-async function buildUserPrompt(ctx: LlmContext, snapshot: PositionSnapshot): Promise<string> {
+function inferEvidenceKeysFromText(text: string): EvidenceKey[] {
+  const s = text.toLowerCase();
+  const keys = new Set<EvidenceKey>();
+  if (s.includes("bundler")) keys.add("bundlerDistribution");
+  if (s.includes("smart money") && (s.includes("sell") || s.includes("selling"))) keys.add("smartMoneySelling");
+  if (s.includes("top holder") && (s.includes("capitulat") || s.includes("underwater") || s.includes("sell"))) {
+    keys.add("topHolderCapitulation");
+  }
+  if (s.includes("volume cliff") || s.includes("volume fading") || s.includes("volume decelerat")) {
+    keys.add("volumeCliff");
+  }
+  if (
+    s.includes("round trip") ||
+    s.includes("round-trip") ||
+    s.includes("gave back") ||
+    s.includes("winner become") ||
+    s.includes("protect peak")
+  ) {
+    keys.add("roundTripRisk");
+  }
+  return [...keys];
+}
+
+function evidenceKeysForRecord(record: Awaited<ReturnType<typeof readLlmTradeRecords>>[number]): EvidenceKey[] {
+  const keys = new Set<EvidenceKey>();
+  for (const d of record.decisions ?? []) {
+    for (const key of [...(d.evidenceKeys ?? []), ...(d.citedFacts ?? [])]) {
+      if ((EVIDENCE_KEYS as readonly string[]).includes(key)) keys.add(key as EvidenceKey);
+    }
+    for (const key of inferEvidenceKeysFromText(d.reason ?? "")) keys.add(key);
+  }
+  if (record.verdict === "round_trip_loss" || record.verdict === "held_partial_gain") {
+    keys.add("roundTripRisk");
+  }
+  return [...keys];
+}
+
+function lessonForVerdict(verdict: string): string {
+  switch (verdict) {
+    case "round_trip_loss":
+      return "Protect runners when deterministic risk appears; holding let a winner round-trip.";
+    case "held_partial_gain":
+      return "Holding stayed profitable but gave back too much of the peak.";
+    case "premature_exit":
+      return "Prior aggressive exit was too early; require stronger convergence.";
+    case "premature_tighten":
+      return "Prior tightening was too early; avoid reacting to one noisy signal.";
+    case "correct_exit":
+      return "Aggressive exit captured most of the available peak.";
+    case "correct_tighten":
+      return "Tightening helped capture a useful part of the move.";
+    case "held_well":
+      return "Holding worked; avoid unnecessary intervention in similar conditions.";
+    case "stuck_loser":
+      return "Weak trades need faster protection when risk evidence is active.";
+    default:
+      return "Mixed outcome; use only as weak context.";
+  }
+}
+
+async function buildSimilarCases(evidence: EvidencePacket): Promise<SimilarCaseSummary | null> {
+  const active = evidence.gate.activeBearishKeys;
+  if (active.length === 0) return null;
+  const records = await readLlmTradeRecords(200).catch(() => []);
+  if (records.length === 0) return null;
+
+  const scored = records
+    .map((record) => {
+      const evidenceKeys = evidenceKeysForRecord(record);
+      const overlap = evidenceKeys.filter((key) => active.includes(key)).length;
+      return { record, evidenceKeys, overlap };
+    })
+    .filter((row) => row.overlap > 0)
+    .sort((a, b) => b.overlap - a.overlap || b.record.closedAt - a.record.closedAt);
+
+  if (scored.length === 0) return null;
+
+  return {
+    totalMatched: scored.length,
+    activeEvidenceKeys: active,
+    cases: scored.slice(0, 5).map(({ record, evidenceKeys }) => {
+      const last = record.decisions?.[record.decisions.length - 1];
+      return {
+        name: record.name,
+        verdict: record.verdict,
+        evidenceKeys,
+        peakPnlPct: fmtNum(record.peakPnlPct * 100, 2),
+        exitPnlPct: fmtNum(record.exitPnlPct * 100, 2),
+        exitReason: record.exitReason,
+        lastAction: last?.action ?? null,
+        lesson: lessonForVerdict(record.verdict),
+      };
+    }),
+  };
+}
+
+async function buildUserPrompt(ctx: LlmContext, snapshot: PositionSnapshot): Promise<PromptBuild> {
   const trackRecord = await buildTrackRecord();
+  const evidence = computeEvidence(ctx, snapshot);
+  const similarCases = await buildSimilarCases(evidence);
   const payload: Record<string, unknown> = {
     position: {
       name: ctx.name,
@@ -472,21 +803,27 @@ async function buildUserPrompt(ctx: LlmContext, snapshot: PositionSnapshot): Pro
       ceilingTrailPctDecimal: fmtNum(ctx.ceilingTrailPct, 4),
       holdSecs: ctx.holdSecs,
     },
+    evidence,
     snapshot: compactSnapshot(snapshot),
     trends: buildTrendsPayload(ctx.mint),
     recentDecisions: buildRecentDecisions(ctx.mint),
   };
   // Only inject track record once we have enough closed trades to be meaningful.
   if (trackRecord) payload.recent_track_record = trackRecord;
+  if (similarCases) payload.similar_cases = similarCases;
 
-  return [
+  const userPrompt = [
     "Decide the exit action for this position using the philosophy in the system prompt.",
+    "Aggressive actions are only allowed when evidence.gate allows them.",
+    "The reason must cite exact evidence keys from evidence.facts.",
     "Call submit_decision exactly once.",
     "",
     "```json",
     JSON.stringify(payload, null, 2),
     "```",
   ].join("\n");
+
+  return { payload, userPrompt, evidence, similarCases };
 }
 
 // ---------------------------------------------------------------------------
@@ -558,9 +895,103 @@ async function callMinimax(
 // ---------------------------------------------------------------------------
 // Decision-parsing
 // ---------------------------------------------------------------------------
+function normalizeCitedFacts(raw: unknown, reason: string): EvidenceKey[] {
+  const out = new Set<EvidenceKey>();
+  if (Array.isArray(raw)) {
+    for (const value of raw) {
+      if (typeof value === "string" && (EVIDENCE_KEYS as readonly string[]).includes(value)) {
+        out.add(value as EvidenceKey);
+      }
+    }
+  }
+  for (const key of EVIDENCE_KEYS) {
+    if (reason.includes(key)) out.add(key);
+  }
+  return [...out];
+}
+
+function reasonWithFactCitations(reason: string, citedFacts: EvidenceKey[]): string {
+  if (citedFacts.length === 0) return reason;
+  const missing = citedFacts.filter((key) => !reason.includes(key));
+  if (missing.length === 0) return reason;
+  return `${reason} Facts: ${missing.join(", ")}.`;
+}
+
+function blockDecision(
+  decision: LlmDecision,
+  evidence: EvidencePacket,
+  blockedAction: NonNullable<EvidenceGate["blockedAction"]>,
+  reason: string,
+): LlmDecision {
+  return {
+    action: "hold",
+    reason,
+    citedFacts: decision.citedFacts,
+    evidenceKeys: evidence.gate.activeBearishKeys,
+    gate: { ...evidence.gate, blockedAction },
+  };
+}
+
+function applyEvidenceGate(
+  decision: LlmDecision,
+  ctx: LlmContext,
+  evidence: EvidencePacket,
+): LlmDecision {
+  const gate = evidence.gate;
+  const active = gate.activeBearishKeys;
+  const factText = active.length > 0 ? active.join(", ") : "none";
+
+  if (decision.action === "partial_exit" && !gate.partialExitAllowed) {
+    logger.warn(
+      { mint: ctx.mint, activeFacts: active, requested: decision.action },
+      "[llm] partial_exit blocked by evidence gate",
+    );
+    return blockDecision(
+      decision,
+      evidence,
+      "partial_exit",
+      `Evidence gate blocked partial_exit; deterministic facts are insufficient. Active facts: ${factText}.`,
+    );
+  }
+
+  if (decision.action === "exit_now" && !gate.exitNowAllowed) {
+    logger.warn(
+      { mint: ctx.mint, activeFacts: active, requested: decision.action },
+      "[llm] exit_now blocked by evidence gate",
+    );
+    return blockDecision(
+      decision,
+      evidence,
+      "exit_now",
+      `Evidence gate blocked exit_now; deterministic facts are insufficient. Active facts: ${factText}.`,
+    );
+  }
+
+  if (
+    decision.action === "set_trail" &&
+    decision.newTrailPct != null &&
+    decision.newTrailPct < ctx.currentTrailPct &&
+    !gate.tightenAllowed
+  ) {
+    logger.warn(
+      { mint: ctx.mint, activeFacts: active, requested: decision.action },
+      "[llm] tightening blocked by evidence gate",
+    );
+    return blockDecision(
+      decision,
+      evidence,
+      "set_trail",
+      `Evidence gate blocked trail tightening; deterministic facts are insufficient. Active facts: ${factText}.`,
+    );
+  }
+
+  return { ...decision, evidenceKeys: active, gate };
+}
+
 function parseDecision(
   resp: ChatCompletionResponse,
   ctx: LlmContext,
+  evidence: EvidencePacket,
 ): LlmDecision | null {
   if (resp.error) {
     logger.warn({ err: resp.error }, "[llm] minimax api error");
@@ -573,7 +1004,13 @@ function parseDecision(
     return null;
   }
 
-  let args: { action?: string; reason?: string; new_trail_pct?: number; sell_pct?: number };
+  let args: {
+    action?: string;
+    reason?: string;
+    cited_facts?: unknown;
+    new_trail_pct?: number;
+    sell_pct?: number;
+  };
   try {
     args = JSON.parse(call.function.arguments) as typeof args;
   } catch (err) {
@@ -593,9 +1030,15 @@ function parseDecision(
     logger.warn("[llm] decision missing reason");
     return null;
   }
+  const citedFacts = normalizeCitedFacts(args.cited_facts, reason);
+  if (action !== "hold" && citedFacts.length === 0) {
+    logger.warn({ action, reason }, "[llm] non-hold decision missing evidence citations");
+    return null;
+  }
+  const citedReason = reasonWithFactCitations(reason, citedFacts);
 
   if (action === "hold" || action === "exit_now") {
-    return { action, reason };
+    return applyEvidenceGate({ action, reason: citedReason, citedFacts }, ctx, evidence);
   }
   if (action === "set_trail") {
     const newTrailPct = Number(args.new_trail_pct);
@@ -614,7 +1057,7 @@ function parseDecision(
       );
       return null;
     }
-    return { action, reason, newTrailPct };
+    return applyEvidenceGate({ action, reason: citedReason, citedFacts, newTrailPct }, ctx, evidence);
   }
   if (action === "partial_exit") {
     const sellPct = Number(args.sell_pct);
@@ -627,7 +1070,7 @@ function parseDecision(
       );
       return null;
     }
-    return { action, reason, sellPct };
+    return applyEvidenceGate({ action, reason: citedReason, citedFacts, sellPct }, ctx, evidence);
   }
 
   logger.warn({ action }, "[llm] unknown action in decision");
@@ -652,17 +1095,57 @@ export async function consultLlm(
     return null;
   }
 
-  const userPrompt = await buildUserPrompt(ctx, snapshot);
+  const prompt = await buildUserPrompt(ctx, snapshot);
   const messages: ChatMessage[] = [
     { role: "system", content: SYSTEM_PROMPT },
-    { role: "user", content: userPrompt },
+    { role: "user", content: prompt.userPrompt },
   ];
 
   const start = Date.now();
   const resp = await callMinimax(apiKey, messages);
-  if (!resp) return null;
+  if (!resp) {
+    void appendLlmPromptAudit({
+      at: start,
+      mint: ctx.mint,
+      name: ctx.name,
+      context: {
+        pnlPct: fmtNum(ctx.pnlPct * 100, 2),
+        peakPnlPct: fmtNum(ctx.peakPnlPct * 100, 2),
+        drawdownFromPeakPct: fmtNum(ctx.drawdownFromPeakPct * 100, 2),
+        currentTrailPct: fmtNum(ctx.currentTrailPct, 4),
+      },
+      evidence: prompt.evidence,
+      similarCases: prompt.similarCases,
+      payload: prompt.payload,
+      userPrompt: prompt.userPrompt,
+      error: "no_response",
+      latencyMs: Date.now() - start,
+    });
+    return null;
+  }
 
-  const decision = parseDecision(resp, ctx);
+  const rawToolArguments = resp.choices?.[0]?.message?.tool_calls?.[0]?.function?.arguments;
+  const decision = parseDecision(resp, ctx, prompt.evidence);
+  void appendLlmPromptAudit({
+    at: start,
+    mint: ctx.mint,
+    name: ctx.name,
+    context: {
+      pnlPct: fmtNum(ctx.pnlPct * 100, 2),
+      peakPnlPct: fmtNum(ctx.peakPnlPct * 100, 2),
+      drawdownFromPeakPct: fmtNum(ctx.drawdownFromPeakPct * 100, 2),
+      currentTrailPct: fmtNum(ctx.currentTrailPct, 4),
+    },
+    evidence: prompt.evidence,
+    similarCases: prompt.similarCases,
+    payload: prompt.payload,
+    userPrompt: prompt.userPrompt,
+    rawToolArguments,
+    decision,
+    gate: decision?.gate,
+    error: decision ? undefined : "parse_or_gate_failed",
+    latencyMs: Date.now() - start,
+  });
   if (decision) {
     logger.info(
       {
@@ -683,6 +1166,14 @@ export async function consultLlm(
       reason: decision.reason,
       pnlPct: ctx.pnlPct,
       peakPnlPct: ctx.peakPnlPct,
+      citedFacts: decision.citedFacts,
+      evidenceKeys: decision.evidenceKeys,
+      gate: decision.gate ? {
+        partialExitAllowed: decision.gate.partialExitAllowed,
+        exitNowAllowed: decision.gate.exitNowAllowed,
+        tightenAllowed: decision.gate.tightenAllowed,
+        blockedAction: decision.gate.blockedAction,
+      } : undefined,
     };
     recordDecision(ctx.mint, decRec);
   }
