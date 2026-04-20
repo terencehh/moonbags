@@ -4,7 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CONFIG } from "./config.js";
 import logger from "./logger.js";
-import { getPositions, getStats, getClosedTrades } from "./positionManager.js";
+import { getPositions, getStats, getClosedTrades, getSignalStats, type SignalStats } from "./positionManager.js";
 import { getRecentAlertEvents } from "./scgPoller.js";
 import { getTokenInfos } from "./jupTokensClient.js";
 import { getKline } from "./okxClient.js";
@@ -158,6 +158,87 @@ async function serveIndex(res: http.ServerResponse): Promise<void> {
   }
 }
 
+function fmt$(n: number): string {
+  if (n === 0) return "$0";
+  if (n >= 1_000_000) return `$${(n / 1_000_000).toFixed(2)}M`;
+  if (n >= 1_000) return `$${(n / 1_000).toFixed(1)}k`;
+  return `$${n.toFixed(0)}`;
+}
+
+function serveStatsHtml(res: http.ServerResponse, stats: SignalStats): void {
+  const filter = stats.activeFilter;
+  const filterStr = (filter.mcapMin > 0 || filter.mcapMax > 0)
+    ? `${filter.mcapMin > 0 ? fmt$(filter.mcapMin) : "$0"} – ${filter.mcapMax > 0 ? fmt$(filter.mcapMax) : "∞"}`
+    : "none";
+
+  const tierRows = stats.byMcapTier.map((t) => `
+    <tr>
+      <td>${t.label}</td>
+      <td>${t.count}</td>
+      <td>${(t.winRate * 100).toFixed(0)}%</td>
+      <td style="color:${t.avgPnlPct >= 0 ? "#22c55e" : "#ef4444"}">${t.avgPnlPct >= 0 ? "+" : ""}${t.avgPnlPct.toFixed(1)}%</td>
+      <td style="color:${t.medianPnlPct >= 0 ? "#22c55e" : "#ef4444"}">${t.medianPnlPct >= 0 ? "+" : ""}${t.medianPnlPct.toFixed(1)}%</td>
+      ${stats.bestMcapTier?.label === t.label ? "<td>★ best</td>" : "<td></td>"}
+    </tr>`).join("");
+
+  const corrRows = Object.entries(stats.correlations).map(([k, v]) => `
+    <tr><td>${k}</td><td style="color:${v >= 0 ? "#22c55e" : "#ef4444"}">${v >= 0 ? "+" : ""}${v.toFixed(3)}</td></tr>`).join("");
+
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<meta http-equiv="refresh" content="30"/>
+<title>Signal Stats — memeautobuy</title>
+<style>
+  body{background:#0f172a;color:#e2e8f0;font-family:monospace;padding:1.5rem;max-width:900px;margin:0 auto}
+  h1{color:#f8fafc;font-size:1.4rem}
+  h2{color:#94a3b8;font-size:1rem;margin-top:1.5rem}
+  table{border-collapse:collapse;width:100%;margin-top:.5rem}
+  th,td{padding:.35rem .7rem;text-align:left;border-bottom:1px solid #1e293b}
+  th{color:#64748b;font-size:.8rem;text-transform:uppercase}
+  .kv{display:flex;gap:2rem;flex-wrap:wrap;margin-top:.5rem}
+  .kv span{color:#64748b;font-size:.85rem}
+  .kv b{color:#f1f5f9}
+  .badge{background:#1e293b;border-radius:4px;padding:.15rem .5rem;font-size:.8rem}
+  footer{color:#334155;margin-top:2rem;font-size:.75rem}
+</style>
+</head>
+<body>
+<h1>Signal Stats</h1>
+<p><span class="badge">${stats.totalTrades} trades with metadata</span>
+   &nbsp;<span class="badge">filter: ${filterStr}</span></p>
+
+<h2>MCap at Entry</h2>
+<div class="kv">
+  <div><span>Median</span><br/><b>${fmt$(stats.mcap.median)}</b></div>
+  <div><span>Mean</span><br/><b>${fmt$(stats.mcap.mean)}</b></div>
+  <div><span>Stdev</span><br/><b>${fmt$(stats.mcap.stdev)}</b></div>
+  <div><span>Min</span><br/><b>${fmt$(stats.mcap.min)}</b></div>
+  <div><span>Max</span><br/><b>${fmt$(stats.mcap.max)}</b></div>
+</div>
+
+<h2>Win Rate by MCap Tier</h2>
+<table>
+  <thead><tr><th>Tier</th><th>Trades</th><th>Win %</th><th>Avg PnL</th><th>Median PnL</th><th></th></tr></thead>
+  <tbody>${tierRows}</tbody>
+</table>
+
+<h2>Pearson Correlation with PnL%</h2>
+<table>
+  <thead><tr><th>Field</th><th>r</th></tr></thead>
+  <tbody>${corrRows}</tbody>
+</table>
+
+<footer>Auto-refreshes every 30s · Use /stats in Telegram to adopt the best range</footer>
+</body>
+</html>`;
+
+  res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Content-Length": Buffer.byteLength(html) });
+  res.end(html);
+}
+
 export function startServer(): () => void {
   const port = CONFIG.DASHBOARD_PORT;
 
@@ -193,8 +274,29 @@ export function startServer(): () => void {
       return;
     }
 
+    if (pathname === "/api/stats") {
+      getSignalStats()
+        .then((stats) => sendJson(res, 200, stats))
+        .catch((err) => {
+          logger.error({ err: String(err) }, "[server] /api/stats failed");
+          sendJson(res, 500, { error: "internal" });
+        });
+      return;
+    }
+
     if (pathname.startsWith("/api/")) {
       sendJson(res, 404, { error: "not found" });
+      return;
+    }
+
+    if (pathname === "/stats") {
+      getSignalStats()
+        .then((stats) => serveStatsHtml(res, stats))
+        .catch((err) => {
+          logger.error({ err: String(err) }, "[server] /stats failed");
+          res.writeHead(500, { "Content-Type": "text/plain" });
+          res.end("internal error");
+        });
       return;
     }
 

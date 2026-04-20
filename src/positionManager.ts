@@ -1,6 +1,6 @@
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import path from "node:path";
-import type { Position, ScgAlert } from "./types.js";
+import type { Position, ScgAlert, SignalMeta } from "./types.js";
 import { CONFIG, SOL_MINT } from "./config.js";
 import logger from "./logger.js";
 import { buyTokenWithSol, sellTokenForSol, getWalletTokenBalance, unwrapResidualWsol } from "./jupClient.js";
@@ -52,6 +52,7 @@ export type ClosedTrade = {
   remainingExitSol?: number;
   llmReason?: string;
   exitSig?: string;
+  signalMeta?: SignalMeta;
 };
 
 // Serializes writes to closed.json — without this, concurrent closes can
@@ -86,6 +87,129 @@ export async function getClosedTrades(limit = 100): Promise<ClosedTrade[]> {
   } catch {
     return [];
   }
+}
+
+// ---------------------------------------------------------------------------
+// Signal statistics — distribution of alert metadata across closed trades.
+// ---------------------------------------------------------------------------
+
+function _smean(arr: number[]): number {
+  return arr.length === 0 ? 0 : arr.reduce((a, b) => a + b, 0) / arr.length;
+}
+function _smedian(arr: number[]): number {
+  if (arr.length === 0) return 0;
+  const s = [...arr].sort((a, b) => a - b);
+  const mid = Math.floor(s.length / 2);
+  return s.length % 2 === 1 ? s[mid]! : (s[mid - 1]! + s[mid]!) / 2;
+}
+function _sstdev(arr: number[]): number {
+  if (arr.length < 2) return 0;
+  const m = _smean(arr);
+  return Math.sqrt(arr.reduce((s, x) => s + (x - m) ** 2, 0) / arr.length);
+}
+function _smode(arr: number[]): number | null {
+  if (arr.length === 0) return null;
+  const freq = new Map<number, number>();
+  for (const v of arr) freq.set(v, (freq.get(v) ?? 0) + 1);
+  let best = 1;
+  let bestVal: number | null = null;
+  for (const [v, n] of freq) { if (n > best) { best = n; bestVal = v; } }
+  return bestVal;
+}
+function _spearson(xs: number[], ys: number[]): number {
+  const n = xs.length;
+  if (n < 3) return 0;
+  const mx = _smean(xs), my = _smean(ys);
+  let num = 0, dx2 = 0, dy2 = 0;
+  for (let i = 0; i < n; i++) {
+    const dx = xs[i]! - mx, dy = ys[i]! - my;
+    num += dx * dy; dx2 += dx * dx; dy2 += dy * dy;
+  }
+  const denom = Math.sqrt(dx2 * dy2);
+  return denom === 0 ? 0 : num / denom;
+}
+
+export interface McapTierStat {
+  label: string;
+  minMcap: number;
+  maxMcap: number;
+  count: number;
+  winRate: number;
+  avgPnlPct: number;
+  medianPnlPct: number;
+}
+
+export interface SignalStats {
+  totalTrades: number;
+  mcap: { mean: number; median: number; mode: number | null; min: number; max: number; stdev: number };
+  byMcapTier: McapTierStat[];
+  bestMcapTier: McapTierStat | null;
+  correlations: Record<string, number>;
+  activeFilter: { mcapMin: number; mcapMax: number };
+}
+
+const MCAP_TIERS = [
+  { label: "<$50k",       minMcap: 0,          maxMcap: 50_000 },
+  { label: "$50k–$200k",  minMcap: 50_000,     maxMcap: 200_000 },
+  { label: "$200k–$500k", minMcap: 200_000,    maxMcap: 500_000 },
+  { label: "$500k–$2M",   minMcap: 500_000,    maxMcap: 2_000_000 },
+  { label: ">$2M",        minMcap: 2_000_000,  maxMcap: Infinity },
+];
+
+export async function getSignalStats(): Promise<SignalStats> {
+  const all = await getClosedTrades(500);
+  const withMeta = all.filter((t) => t.signalMeta != null);
+
+  const mcaps = withMeta.map((t) => t.signalMeta!.alert_mcap);
+  const pnls  = withMeta.map((t) => t.pnlPct);
+
+  const byMcapTier: McapTierStat[] = MCAP_TIERS.map((tier) => {
+    const trades = withMeta.filter((t) =>
+      t.signalMeta!.alert_mcap >= tier.minMcap && t.signalMeta!.alert_mcap < tier.maxMcap,
+    );
+    const pnlVals = trades.map((t) => t.pnlPct);
+    const wins = trades.filter((t) => t.pnlPct > 0).length;
+    return {
+      label: tier.label,
+      minMcap: tier.minMcap,
+      maxMcap: tier.maxMcap === Infinity ? 0 : tier.maxMcap,
+      count: trades.length,
+      winRate: trades.length > 0 ? wins / trades.length : 0,
+      avgPnlPct: trades.length > 0 ? _smean(pnlVals) : 0,
+      medianPnlPct: trades.length > 0 ? _smedian(pnlVals) : 0,
+    };
+  });
+
+  const qualified = byMcapTier.filter((t) => t.count >= 3);
+  const bestMcapTier = qualified.length > 0
+    ? qualified.reduce((a, b) => b.avgPnlPct > a.avgPnlPct ? b : a)
+    : null;
+
+  const corrFields: Array<keyof SignalMeta> = [
+    "alert_mcap", "bundler_pct", "kol_count", "bs_ratio", "score", "age_mins", "holders",
+  ];
+  const correlations: Record<string, number> = {};
+  for (const field of corrFields) {
+    const xs = withMeta.map((t) => (t.signalMeta![field] as number) ?? 0);
+    correlations[field] = _spearson(xs, pnls);
+  }
+
+  const { alertFilter } = getRuntimeSettings();
+  return {
+    totalTrades: withMeta.length,
+    mcap: {
+      mean:   _smean(mcaps),
+      median: _smedian(mcaps),
+      mode:   _smode(mcaps),
+      min:    mcaps.length > 0 ? Math.min(...mcaps) : 0,
+      max:    mcaps.length > 0 ? Math.max(...mcaps) : 0,
+      stdev:  _sstdev(mcaps),
+    },
+    byMcapTier,
+    bestMcapTier,
+    correlations,
+    activeFilter: { mcapMin: alertFilter.mcapMin, mcapMax: alertFilter.mcapMax },
+  };
 }
 
 function serializePos(p: Position): Record<string, unknown> {
@@ -359,6 +483,19 @@ export async function openPosition(alert: ScgAlert): Promise<Position | null> {
     armed: false,
     openedAt: Date.now(),
     lastTickAt: Date.now(),
+    signalMeta: {
+      alert_mcap:   alert.alert_mcap,
+      age_mins:     alert.age_mins,
+      holders:      alert.holders,
+      bs_ratio:     alert.bs_ratio,
+      bundler_pct:  alert.bundler_pct,
+      top10_pct:    alert.top10_pct,
+      kol_count:    alert.kol_count,
+      signal_count: alert.signal_count,
+      rug_ratio:    alert.rug_ratio,
+      liq_trend:    alert.liq_trend,
+      score:        alert.score,
+    },
   };
   positions.set(alert.mint, position);
   await flushPersist();
@@ -1028,6 +1165,7 @@ async function closePosition(mint: string, reason: CloseReason): Promise<void> {
     remainingExitSol: partials.count ? exitSol : undefined,
     reason, llmReason: reason === "llm" ? position.lastLlmReason : undefined,
     exitSig: sellResult.signature,
+    signalMeta: position.signalMeta,
   });
 
   // L3 shadow logger: persist decision timeline + post-mortem verdict so

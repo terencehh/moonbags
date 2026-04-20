@@ -47,6 +47,10 @@ export type RuntimeSettings = {
     enabled: boolean;
     pcts: number[];
   };
+  alertFilter: {
+    mcapMin: number;
+    mcapMax: number;
+  };
 };
 
 export const EXIT_STRATEGY_LABELS: Record<ExitStrategyMode, string> = {
@@ -99,6 +103,10 @@ function defaultSettings(): RuntimeSettings {
       enabled: CONFIG.MILESTONES_ENABLED,
       pcts: CONFIG.MILESTONE_PCTS,
     },
+    alertFilter: {
+      mcapMin: CONFIG.MIN_ALERT_MCAP,
+      mcapMax: CONFIG.MAX_ALERT_MCAP,
+    },
   };
 }
 
@@ -137,6 +145,8 @@ function normalizeSettings(raw: unknown): RuntimeSettings {
   const runner = (exit.runner && typeof exit.runner === "object" ? exit.runner : {}) as Record<string, unknown>;
   const llm = (exit.llm && typeof exit.llm === "object" ? exit.llm : {}) as Record<string, unknown>;
   const milestones = (root.milestones && typeof root.milestones === "object" ? root.milestones : {}) as Record<string, unknown>;
+
+  const alertFilter = (root.alertFilter && typeof root.alertFilter === "object" ? root.alertFilter : {}) as Record<string, unknown>;
 
   const rawType = profit.type;
   const type: ExitStrategyMode =
@@ -182,6 +192,10 @@ function normalizeSettings(raw: unknown): RuntimeSettings {
       enabled: bool(milestones.enabled, defaults.milestones.enabled),
       pcts,
     },
+    alertFilter: {
+      mcapMin: num(alertFilter.mcapMin, defaults.alertFilter.mcapMin, 0),
+      mcapMax: num(alertFilter.mcapMax, defaults.alertFilter.mcapMax, 0),
+    },
   };
 }
 
@@ -204,6 +218,8 @@ function syncConfig(next: RuntimeSettings): void {
     next.exit.llm.enabled || next.exit.profitStrategy.type === "llm_managed";
   (CONFIG as unknown as Record<string, unknown>).MILESTONES_ENABLED = next.milestones.enabled;
   (CONFIG as unknown as Record<string, unknown>).MILESTONE_PCTS = next.milestones.pcts;
+  (CONFIG as unknown as Record<string, unknown>).MIN_ALERT_MCAP = next.alertFilter.mcapMin;
+  (CONFIG as unknown as Record<string, unknown>).MAX_ALERT_MCAP = next.alertFilter.mcapMax;
 }
 
 function loadSettings(): RuntimeSettings {
@@ -255,6 +271,8 @@ export function syncRuntimeSettingsFromConfig(): RuntimeSettings {
     draft.exit.llm.enabled = CONFIG.LLM_EXIT_ENABLED;
     draft.milestones.enabled = CONFIG.MILESTONES_ENABLED;
     draft.milestones.pcts = CONFIG.MILESTONE_PCTS;
+    draft.alertFilter.mcapMin = CONFIG.MIN_ALERT_MCAP;
+    draft.alertFilter.mcapMax = CONFIG.MAX_ALERT_MCAP;
     if (CONFIG.LLM_EXIT_ENABLED) {
       draft.exit.profitStrategy.type = "llm_managed";
     } else if (draft.exit.profitStrategy.type === "llm_managed") {

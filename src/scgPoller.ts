@@ -173,6 +173,12 @@ export function startScgPoller(onNew: AlertHandler): () => void {
     if (CONFIG.REQUIRE_RISING_LIQ && a.liq_trend !== "rising") {
       return { ok: false, reason: `liq_trend ${a.liq_trend} !== rising` };
     }
+    if (CONFIG.MIN_ALERT_MCAP > 0 && a.alert_mcap < CONFIG.MIN_ALERT_MCAP) {
+      return { ok: false, reason: `alert_mcap ${a.alert_mcap} < ${CONFIG.MIN_ALERT_MCAP}` };
+    }
+    if (CONFIG.MAX_ALERT_MCAP > 0 && a.alert_mcap > CONFIG.MAX_ALERT_MCAP) {
+      return { ok: false, reason: `alert_mcap ${a.alert_mcap} > ${CONFIG.MAX_ALERT_MCAP}` };
+    }
     return { ok: true };
   }
 

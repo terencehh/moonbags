@@ -28,6 +28,20 @@ export interface ScgAlert {
   completed: boolean;
 }
 
+export interface SignalMeta {
+  alert_mcap: number;
+  age_mins: number;
+  holders: number;
+  bs_ratio: number;
+  bundler_pct: number;
+  top10_pct: number;
+  kol_count: number;
+  signal_count: number;
+  rug_ratio: number;
+  liq_trend: string;
+  score: number;
+}
+
 export interface ScgAlertsResponse {
   alerts: ScgAlert[];
 }
@@ -77,6 +91,7 @@ export interface Position {
     reason: string;       // LLM's reason
     sig?: string;         // tx signature
   }>;
+  signalMeta?: SignalMeta;
 }
 
 export interface JupOrderResponse {
