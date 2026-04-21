@@ -29,3 +29,4 @@ backtest_*.csv
 # === Screenshots / ad-hoc captures ===
 *.png
 !docs/**/*.png
+moonbags-twitter-hype/

@@ -1,6 +1,8 @@
 export interface ScgAlert {
   mint: string;
   name: string;
+  source?: "scg" | "okx" | string;
+  sourceMeta?: Record<string, unknown>;
   logo?: string;
   score: number;
   alert_time: number;

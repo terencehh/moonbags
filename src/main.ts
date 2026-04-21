@@ -5,6 +5,7 @@ import { startTelegramBot } from "./telegramBot.js";
 import { notifyBoot } from "./notifier.js";
 import { unwrapResidualWsol } from "./jupClient.js";
 import { startOkxWsService, stopOkxWsService, watchOkxWsMint } from "./okxWsService.js";
+import { startOkxSignalSource, stopOkxSignalSource } from "./okxSignalSource.js";
 import { CONFIG } from "./config.js";
 import logger from "./logger.js";
 
@@ -49,6 +50,15 @@ async function main(): Promise<void> {
   for (const position of getPositions().filter((p) => p.status === "open")) {
     void watchOkxWsMint(position.mint);
   }
+  startOkxSignalSource({
+    onAcceptedCandidate: async (alert) => {
+      try {
+        await openPosition(alert);
+      } catch (e) {
+        logger.error({ err: String(e), mint: alert.mint }, "openPosition crashed for OKX signal");
+      }
+    },
+  });
 
   const stopServer = startServer();
   logger.info({ url: `http://localhost:${CONFIG.DASHBOARD_PORT}/` }, "dashboard available");
@@ -94,8 +104,12 @@ async function main(): Promise<void> {
     stopTelegram();
     clearInterval(tickInterval);
     clearInterval(llmInterval);
-    void stopOkxWsService()
-      .catch((err) => logger.warn({ err: String(err) }, "[okx-wss] shutdown stop failed"))
+    void Promise.allSettled([stopOkxWsService(), stopOkxSignalSource()])
+      .then((results) => {
+        for (const result of results) {
+          if (result.status === "rejected") logger.warn({ err: String(result.reason) }, "[shutdown] source stop failed");
+        }
+      })
       .finally(() => setTimeout(() => process.exit(0), 500));
   };
   process.on("SIGINT", () => shutdown("SIGINT"));

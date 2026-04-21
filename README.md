@@ -69,6 +69,7 @@ If you want to see the signal quality firsthand, follow [@scg_alpha](https://x.c
 ## What it does
 
 1. **Receives** filtered alerts from SCG Alpha's API every 3 seconds — these are pre-vetted by their alpha-filtering system on top of GMGN.
+   - Optional: `/sources` can add OKX smart-money/KOL/whale WSS signals as a second entry source.
 2. **Buys** new alerts that pass your local filters via Jupiter Ultra (Solana DEX aggregator), spending a fixed SOL amount per trade.
 3. **Tracks** every open position every 3 seconds — pulls live prices, updates the running peak, and checks for arm/trail/stop conditions.
 4. **Arms** a trailing stop once a position hits a profit threshold (default +50%).
@@ -554,6 +555,7 @@ Every command is gated to the `TELEGRAM_CHAT_ID` in `.env` — random users who 
 | `/mcapfilter [min] [max\|off]` | Set or clear the mcap entry filter manually. `/mcapfilter 50000 200000` = $50k–$200k range. `/mcapfilter 50000` = $50k floor, no ceiling. `/mcapfilter off` = clear. Persists in `state/settings.json`. |
 | `/history [N]` | Last N closed trades (default 10, max 50) — name, PnL, exit reason, hold duration. |
 | `/llm` | One-tap toggle for the LLM exit advisor. Warns if `MINIMAX_API_KEY` is empty. |
+| `/sources` | Choose entry source mode: SCG only, OKX Watch, Hybrid Live, or OKX only. |
 | `/wss` | OKX WSS status and enable/disable buttons for open-position market-data acceleration. |
 | `/pause` | Stop taking new SCG alerts. Open positions keep running. **Persists across restart.** |
 | `/resume` | Resume taking new alerts. |
@@ -579,6 +581,17 @@ Sent to your Telegram chat as events happen. Dedupe is built in so you don't get
 - `🟢 SELL` — every close, with reason + PnL. Includes the LLM's reasoning when it triggered the exit.
 - `❌ BUY FAILED` — when a swap couldn't land
 - `🚨 SELL STUCK` — after 10 sell retries failed (needs manual action)
+
+### Signal source modes
+
+`/sources` controls what can create entry signals:
+
+- **SCG only** — default. Only SCG Alpha alerts can buy.
+- **OKX Watch** — SCG still buys; OKX discovery signals are tracked and shown but never bought.
+- **Hybrid Live** — SCG alerts and live OKX discovery signals can both buy.
+- **OKX only** — SCG keeps polling for health/status, but only OKX discovery signals can buy.
+
+OKX discovery uses `dex-market-new-signal-openapi`, the OnchainOS smart-money/KOL/whale signal feed. Historical `onchainos signal list` rows are used only to seed dedupe on startup, so old rows are not bought. Live OKX signals are treated as entry triggers in Hybrid/OKX-only modes; pause, blacklist, duplicate/mint cooldown, max-position, and Jupiter execution safety still apply.
 
 **Settings you can edit live via `/settings`:**
 

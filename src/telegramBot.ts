@@ -35,9 +35,11 @@ import {
   parseTpTargetsInput,
   setExitStrategy,
   setTpTargets,
+  SOURCE_MODE_LABELS,
   syncRuntimeSettingsFromConfig,
   updateRuntimeSettings,
   type ExitStrategyMode,
+  type SourceMode,
 } from "./settingsStore.js";
 
 type Update = {
@@ -75,6 +77,20 @@ const BACKTEST_LADDER_PRESETS: Record<string, BacktestTpTarget[]> = {
   runner: [{ pnlPct: 0.50, sellPct: 0.25 }, { pnlPct: 1.00, sellPct: 0.25 }, { pnlPct: 2.00, sellPct: 0.25 }],
 };
 
+const SOURCE_MODES: SourceMode[] = ["scg_only", "okx_watch", "hybrid", "okx_only"];
+const OKX_SIGNAL_SOURCE_MODULE = "./okxSignalSource.js";
+
+type OkxSignalSourceModule = {
+  getOkxSignalStatus?: () => unknown | Promise<unknown>;
+  refreshOkxSignalSource?: () => void | Promise<void>;
+};
+
+type OkxSignalStatusResult = {
+  available: boolean;
+  status?: unknown;
+  error?: string;
+};
+
 function setConfigValue(key: SettableKey, raw: string): SetConfigResult {
   const result = setConfigValueRaw(key, raw);
   if (result.ok) syncRuntimeSettingsFromConfig();
@@ -85,6 +101,48 @@ function toggleConfigValue(key: SettableKey): SetConfigResult {
   const result = toggleConfigValueRaw(key);
   if (result.ok) syncRuntimeSettingsFromConfig();
   return result;
+}
+
+function isSourceMode(value: string): value is SourceMode {
+  return SOURCE_MODES.includes(value as SourceMode);
+}
+
+async function loadOkxSignalSource(): Promise<OkxSignalSourceModule | null> {
+  try {
+    return (await import(OKX_SIGNAL_SOURCE_MODULE)) as OkxSignalSourceModule;
+  } catch (err) {
+    const msg = (err as Error)?.message ?? String(err);
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code !== "ERR_MODULE_NOT_FOUND" && code !== "MODULE_NOT_FOUND") {
+      logger.warn({ err: msg }, "[okx-signal] failed to load source module");
+    }
+    return null;
+  }
+}
+
+async function getSafeOkxSignalStatus(): Promise<OkxSignalStatusResult> {
+  const mod = await loadOkxSignalSource();
+  if (!mod?.getOkxSignalStatus) {
+    return { available: false, error: "src/okxSignalSource.ts not loaded yet" };
+  }
+  try {
+    return { available: true, status: await mod.getOkxSignalStatus() };
+  } catch (err) {
+    return { available: false, error: (err as Error)?.message ?? String(err) };
+  }
+}
+
+async function refreshSafeOkxSignalSource(): Promise<OkxSignalStatusResult> {
+  const mod = await loadOkxSignalSource();
+  if (!mod?.refreshOkxSignalSource) {
+    return { available: false, error: "src/okxSignalSource.ts not loaded yet" };
+  }
+  try {
+    await mod.refreshOkxSignalSource();
+    return getSafeOkxSignalStatus();
+  } catch (err) {
+    return { available: false, error: (err as Error)?.message ?? String(err) };
+  }
 }
 
 async function setWssEnabled(enabled: boolean): Promise<void> {
@@ -577,6 +635,12 @@ async function handleCallback(cq: NonNullable<Update["callback_query"]>): Promis
     return;
   }
 
+  if (data === "sources:refresh" || data.startsWith("sources:mode:")) {
+    const message = await handleSources(chatId, data);
+    await tgPost("answerCallbackQuery", { callback_query_id: cq.id, text: message });
+    return;
+  }
+
   if (data === "wss:refresh") {
     await tgPost("answerCallbackQuery", { callback_query_id: cq.id, text: "Refreshed" });
     await handleWss(chatId);
@@ -716,6 +780,190 @@ function formatRecentPollerDecisions(): string[] {
   return lines;
 }
 
+function looseRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function readPath(root: unknown, pathParts: string[]): unknown {
+  let current: unknown = root;
+  for (const part of pathParts) {
+    const rec = looseRecord(current);
+    if (!rec || !(part in rec)) return undefined;
+    current = rec[part];
+  }
+  return current;
+}
+
+function firstNumber(root: unknown, paths: string[][]): number | null {
+  for (const pathParts of paths) {
+    const raw = readPath(root, pathParts);
+    const n = typeof raw === "number" ? raw : typeof raw === "string" ? Number(raw) : NaN;
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
+function firstString(root: unknown, paths: string[][]): string | null {
+  for (const pathParts of paths) {
+    const raw = readPath(root, pathParts);
+    if (typeof raw === "string" && raw.trim().length > 0) return raw.trim();
+    if (typeof raw === "number" && Number.isFinite(raw)) return String(raw);
+  }
+  return null;
+}
+
+function firstObject(root: unknown, paths: string[][]): Record<string, unknown> | null {
+  for (const pathParts of paths) {
+    const rec = looseRecord(readPath(root, pathParts));
+    if (rec) return rec;
+  }
+  return null;
+}
+
+function formatLooseCount(value: number | null): string {
+  return value == null ? "—" : value.toLocaleString("en-US");
+}
+
+function formatLooseCandidate(candidate: Record<string, unknown> | null): string {
+  if (!candidate) return "—";
+  const name = firstString(candidate, [["name"], ["symbol"], ["tokenSymbol"], ["token", "symbol"]]);
+  const mint = firstString(candidate, [["mint"], ["address"], ["tokenAddress"], ["token", "mint"], ["token", "address"]]);
+  const score = firstNumber(candidate, [["score"], ["organicScore"], ["confidence"]]);
+  const mcap = firstNumber(candidate, [["mcap"], ["marketCap"], ["marketCapUsd"], ["market_cap_usd"]]);
+  const liq = firstNumber(candidate, [["liquidity"], ["liquidityUsd"], ["liquidity_usd"]]);
+  const wallets = firstNumber(candidate, [["triggerWallets"], ["wallets"], ["walletCount"], ["stats", "triggerWallets"]]);
+  const pieces = [
+    name ? `<code>${escapeHtml(name)}</code>` : null,
+    mint ? `<code>${escapeHtml(mint.slice(0, 6))}…${escapeHtml(mint.slice(-4))}</code>` : null,
+    score != null ? `score ${score}` : null,
+    mcap != null ? `mcap ${fmtMcap(mcap)}` : null,
+    liq != null ? `liq ${fmtMcap(liq)}` : null,
+    wallets != null ? `${wallets} wallets` : null,
+  ].filter(Boolean);
+  return pieces.length > 0 ? pieces.join(" · ") : "candidate seen";
+}
+
+function okxStatusCounts(status: unknown): { seen: number | null; filtered: number | null; accepted: number | null } {
+  return {
+    seen: firstNumber(status, [["seen"], ["candidatesSeen"], ["seenCount"], ["counts", "seen"], ["stats", "seen"]]),
+    filtered: firstNumber(status, [["filtered"], ["rejected"], ["filteredCount"], ["counts", "filtered"], ["counts", "rejected"], ["stats", "filtered"]]),
+    accepted: firstNumber(status, [["accepted"], ["fired"], ["acceptedCount"], ["counts", "accepted"], ["counts", "fired"], ["stats", "accepted"]]),
+  };
+}
+
+function okxDiscoveryStatusLines(result: OkxSignalStatusResult): string[] {
+  if (!result.available) {
+    return [`• status: unavailable — <code>${escapeHtml(result.error ?? "unknown")}</code>`];
+  }
+  const status = result.status;
+  const enabled = firstString(status, [["enabled"]]);
+  const state =
+    firstString(status, [["state"], ["status"], ["mode"]]) ??
+    (enabled === "false" ? "disabled" : enabled === "true" ? "enabled" : "loaded");
+  const lastRefreshAt = firstNumber(status, [["lastRefreshAt"], ["lastScanAt"], ["lastTickAt"], ["lastRunAt"]]);
+  const lastError = firstString(status, [["lastError"], ["error"]]);
+  const counts = okxStatusCounts(status);
+  const latest = firstObject(status, [["latestCandidate"], ["latest"], ["candidate"], ["latestSignal"], ["lastCandidate"]]);
+  const rejection = firstString(status, [
+    ["lastRejectionReason"],
+    ["lastRejectReason"],
+    ["lastFilteredReason"],
+    ["lastRejected", "reason"],
+    ["lastRejection", "reason"],
+  ]);
+  const lines = [
+    `• status: ${escapeHtml(state)}${lastRefreshAt ? ` · last refresh ${formatAgo(Date.now() - lastRefreshAt)}` : ""}`,
+    `• counts: seen ${formatLooseCount(counts.seen)} · filtered ${formatLooseCount(counts.filtered)} · accepted ${formatLooseCount(counts.accepted)}`,
+    `• latest candidate: ${formatLooseCandidate(latest)}`,
+    `• last rejection: ${rejection ? `<code>${escapeHtml(rejection)}</code>` : "—"}`,
+  ];
+  if (lastError) {
+    lines.push(`• last error: <code>${escapeHtml(lastError)}</code>`);
+  }
+  return lines;
+}
+
+function sourceModeKeyboard(current: SourceMode): Array<Array<{ text: string; callback_data: string }>> {
+  const button = (mode: SourceMode): { text: string; callback_data: string } => ({
+    text: `${current === mode ? "✅ " : ""}${SOURCE_MODE_LABELS[mode]}`,
+    callback_data: `sources:mode:${mode}`,
+  });
+  return [
+    [button("scg_only"), button("okx_watch")],
+    [button("hybrid"), button("okx_only")],
+    [{ text: "🔄 Refresh", callback_data: "sources:refresh" }],
+  ];
+}
+
+async function sendSourcesMenu(chatId: number): Promise<void> {
+  const settings = getRuntimeSettings();
+  const sourceMode = settings.signals.sourceMode;
+  const health = getPollerHealth();
+  const now = Date.now();
+  const recent = getRecentAlertEvents();
+  const fired = recent.filter((e) => e.action === "fired").length;
+  const filtered = recent.filter((e) => e.action === "filtered").length;
+  const latest = recent[recent.length - 1];
+  const lastRejected = [...recent].reverse().find((e) => e.action === "filtered" && e.reason);
+  const scgState = isPaused()
+    ? "paused"
+    : health.lastTickError
+      ? "error"
+      : health.lastTickOkAt
+        ? "polling"
+        : "starting";
+  const okxStatus = await getSafeOkxSignalStatus();
+
+  const lines = [
+    "🧭 <b>Signal sources</b>",
+    "",
+    `Active mode: <b>${SOURCE_MODE_LABELS[sourceMode]}</b> <code>${sourceMode}</code>`,
+    "",
+    "<b>SCG Alpha</b>",
+    `• status: ${scgState} · last poll ${health.lastTickOkAt ? formatAgo(now - health.lastTickOkAt) : "never"} · HTTP ${health.lastHttpStatus ?? "—"}`,
+    `• counts: seen ${health.seenSize.toLocaleString("en-US")} · filtered ${filtered.toLocaleString("en-US")} · accepted ${fired.toLocaleString("en-US")} (recent ${recent.length})`,
+    `• latest candidate: ${latest ? `<code>${escapeHtml(latest.name)}</code> · ${latest.action}${latest.reason ? ` · ${escapeHtml(latest.reason)}` : ""}` : "—"}`,
+    `• last rejection: ${lastRejected?.reason ? `<code>${escapeHtml(lastRejected.reason)}</code>` : "—"}`,
+    "",
+    "<b>OKX discovery</b>",
+    ...okxDiscoveryStatusLines(okxStatus),
+    "",
+    "<i>Mode changes save to state/settings.json and ask OKX discovery to refresh.</i>",
+  ];
+
+  await tgPost("sendMessage", {
+    chat_id: chatId,
+    text: lines.join("\n"),
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+    reply_markup: { inline_keyboard: sourceModeKeyboard(sourceMode) },
+  });
+}
+
+async function handleSources(chatId: number, data?: string): Promise<string> {
+  if (data?.startsWith("sources:mode:")) {
+    const rawMode = data.slice("sources:mode:".length);
+    if (!isSourceMode(rawMode)) return "Unknown source mode";
+    updateRuntimeSettings((draft) => {
+      draft.signals.sourceMode = rawMode;
+      draft.signals.okx.enabled = rawMode !== "scg_only";
+    });
+    await refreshSafeOkxSignalSource();
+    await sendSourcesMenu(chatId);
+    logger.info({ sourceMode: rawMode }, "[settings] source mode updated via telegram");
+    return `${SOURCE_MODE_LABELS[rawMode]} selected`;
+  }
+
+  if (data === "sources:refresh") {
+    await refreshSafeOkxSignalSource();
+    await sendSourcesMenu(chatId);
+    return "Refreshed";
+  }
+
+  await sendSourcesMenu(chatId);
+  return "Sources";
+}
+
 async function handlePing(chatId: number): Promise<void> {
   const lines: string[] = ["🩺 <b>Connectivity check</b>"];
 
@@ -802,11 +1050,17 @@ async function handlePing(chatId: number): Promise<void> {
   lines.push(`• dedup set size: ${health.seenSize}`);
   lines.push(`• paused: ${paused ? "🟡 yes — run /resume" : "no"}`);
   lines.push(`• blacklisted mints: ${getBlacklist().length}`);
+  const sourceMode = getRuntimeSettings().signals.sourceMode;
+  const okxDiscovery = await getSafeOkxSignalStatus();
+  lines.push("");
+  lines.push("<b>Signal sources</b>");
+  lines.push(`• active mode: <b>${SOURCE_MODE_LABELS[sourceMode]}</b> <code>${sourceMode}</code>`);
+  lines.push(...okxDiscoveryStatusLines(okxDiscovery).map((line) => `• OKX discovery ${line.slice(2)}`));
   const wss = getOkxWsStatus();
   const wssLastEventAgo = wss.lastEventAt ? formatAgo(Date.now() - wss.lastEventAt) : "never";
   const wssLastPollAgo = wss.lastPollAt ? formatAgo(Date.now() - wss.lastPollAt) : "never";
   lines.push("");
-  lines.push("<b>OKX WSS</b>");
+  lines.push("<b>OKX open-position WSS</b>");
   lines.push(
     `• status: ${wss.enabled ? "enabled" : "disabled"} · ${wss.activeSessions}/${wss.watchedMints} sessions · last event ${wssLastEventAgo} · last poll ${wssLastPollAgo}`,
   );
@@ -837,7 +1091,7 @@ async function handleWss(chatId: number): Promise<void> {
   const lastPoll = status.lastPollAt ? formatAgo(now - status.lastPollAt) : "never";
   const openCount = getPositions().filter((p) => p.status === "open").length;
   const lines = [
-    "📡 <b>OKX WSS</b>",
+    "📡 <b>OKX open-position WSS</b>",
     "",
     `Status: <b>${status.enabled ? "enabled" : "disabled"}</b>`,
     `Sessions: <b>${status.activeSessions}/${status.watchedMints}</b> active · ${openCount} open positions`,
@@ -1933,6 +2187,7 @@ export function startTelegramBot(): () => void {
       { command: "mcapfilter", description: "Set MCap entry filter (e.g. /mcapfilter 50000 200000 or off)" },
       { command: "history",   description: "Last N closed trades (default 10)" },
       { command: "settings",  description: "Edit trading params live (no restart)" },
+      { command: "sources",   description: "Signal source mode + SCG/OKX discovery status" },
       { command: "llm",       description: "Toggle the LLM exit advisor on/off" },
       { command: "wss",       description: "OKX WSS status + open-position acceleration toggle" },
       { command: "pause",     description: "Stop taking new SCG alerts" },
@@ -2015,6 +2270,7 @@ export function startTelegramBot(): () => void {
               case "/start":     await sendStartMenu(chatId); break;
               case "/positions": await sendPositions(chatId); break;
               case "/settings":  await sendSettingsMenu(chatId); break;
+              case "/sources":   await handleSources(chatId); break;
               case "/pnl":       await handlePnl(chatId); break;
               case "/stats":        await handleStats(chatId); break;
               case "/mcapfilter":  await handleMcapFilter(chatId, argText); break;

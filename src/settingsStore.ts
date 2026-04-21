@@ -7,6 +7,7 @@ const STATE_DIR = path.resolve("state");
 const SETTINGS_FILE = path.join(STATE_DIR, "settings.json");
 
 export type ExitStrategyMode = "trail" | "fixed_tp" | "tp_ladder" | "llm_managed";
+export type SourceMode = "scg_only" | "okx_watch" | "hybrid" | "okx_only";
 
 export type TpTarget = {
   pnlPct: number;  // decimal, e.g. 0.5 = +50%
@@ -51,6 +52,14 @@ export type RuntimeSettings = {
     mcapMin: number;
     mcapMax: number;
   };
+  signals: {
+    sourceMode: SourceMode;
+    okx: {
+      enabled: boolean;
+      seedLimit: number;
+      mintCooldownMins: number;
+    };
+  };
   marketData: {
     wss: {
       enabled: boolean;
@@ -66,6 +75,13 @@ export const EXIT_STRATEGY_LABELS: Record<ExitStrategyMode, string> = {
   fixed_tp: "Fixed TP",
   tp_ladder: "TP Ladder",
   llm_managed: "LLM Managed",
+};
+
+export const SOURCE_MODE_LABELS: Record<SourceMode, string> = {
+  scg_only: "SCG only",
+  okx_watch: "OKX Watch",
+  hybrid: "Hybrid Live",
+  okx_only: "OKX only",
 };
 
 const DEFAULT_TP_TARGETS: TpTarget[] = [
@@ -114,6 +130,14 @@ function defaultSettings(): RuntimeSettings {
     alertFilter: {
       mcapMin: CONFIG.MIN_ALERT_MCAP,
       mcapMax: CONFIG.MAX_ALERT_MCAP,
+    },
+    signals: {
+      sourceMode: "scg_only",
+      okx: {
+        enabled: false,
+        seedLimit: 100,
+        mintCooldownMins: 60,
+      },
     },
     marketData: {
       wss: {
@@ -171,6 +195,8 @@ function normalizeSettings(raw: unknown): RuntimeSettings {
   const milestones = (root.milestones && typeof root.milestones === "object" ? root.milestones : {}) as Record<string, unknown>;
 
   const alertFilter = (root.alertFilter && typeof root.alertFilter === "object" ? root.alertFilter : {}) as Record<string, unknown>;
+  const signals = (root.signals && typeof root.signals === "object" ? root.signals : {}) as Record<string, unknown>;
+  const okxSignals = (signals.okx && typeof signals.okx === "object" ? signals.okx : {}) as Record<string, unknown>;
   const marketData = (root.marketData && typeof root.marketData === "object" ? root.marketData : {}) as Record<string, unknown>;
   const wss = (marketData.wss && typeof marketData.wss === "object" ? marketData.wss : {}) as Record<string, unknown>;
 
@@ -183,6 +209,11 @@ function normalizeSettings(raw: unknown): RuntimeSettings {
   const pcts = Array.isArray(milestones.pcts)
     ? milestones.pcts.map((p) => num(p, NaN, 0.01, 100000)).filter(Number.isFinite)
     : defaults.milestones.pcts;
+  const rawSourceMode = signals.sourceMode;
+  const sourceMode: SourceMode =
+    rawSourceMode === "okx_watch" || rawSourceMode === "hybrid" || rawSourceMode === "okx_only" || rawSourceMode === "scg_only"
+      ? rawSourceMode
+      : defaults.signals.sourceMode;
 
   return {
     version: 1,
@@ -221,6 +252,14 @@ function normalizeSettings(raw: unknown): RuntimeSettings {
     alertFilter: {
       mcapMin: num(alertFilter.mcapMin, defaults.alertFilter.mcapMin, 0),
       mcapMax: num(alertFilter.mcapMax, defaults.alertFilter.mcapMax, 0),
+    },
+    signals: {
+      sourceMode,
+      okx: {
+        enabled: bool(okxSignals.enabled, sourceMode === "okx_watch" || sourceMode === "hybrid" || sourceMode === "okx_only"),
+        seedLimit: Math.round(num(okxSignals.seedLimit, defaults.signals.okx.seedLimit, 0, 5000)),
+        mintCooldownMins: num(okxSignals.mintCooldownMins, defaults.signals.okx.mintCooldownMins, 0, 1440),
+      },
     },
     marketData: {
       wss: {

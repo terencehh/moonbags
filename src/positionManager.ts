@@ -517,6 +517,8 @@ export async function openPosition(alert: ScgAlert): Promise<Position | null> {
   void notifyBuy({
     name: alert.name,
     mint: alert.mint,
+    source: alert.source ?? "scg",
+    sourceMeta: alert.sourceMeta,
     solSpent: position.entrySolSpent,
     entryMcap: alert.alert_mcap,
     entryPrice: entryPricePerTokenSol,

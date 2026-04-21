@@ -82,13 +82,23 @@ export function notifyBoot(): Promise<void> {
 export function notifyBuy(args: {
   name: string;
   mint: string;
+  source?: string;
+  sourceMeta?: Record<string, unknown>;
   solSpent: number;
   entryMcap: number;
   entryPrice: number;
   signature: string;
 }): Promise<void> {
+  const source = args.source ? args.source.toUpperCase() : "SCG";
+  const wallets = typeof args.sourceMeta?.triggerWalletCount === "number"
+    ? ` · ${args.sourceMeta.triggerWalletCount} wallets`
+    : "";
+  const amount = typeof args.sourceMeta?.amountUsd === "number"
+    ? ` · $${Math.round(args.sourceMeta.amountUsd).toLocaleString("en-US")}`
+    : "";
   const text =
     `🟢 <b>BUY ${escapeHtml(args.name)}</b>\n` +
+    `source: <b>${escapeHtml(source)}</b>${wallets}${amount}\n` +
     `mcap: ${mcapFmt(args.entryMcap)}  |  spent: ${args.solSpent.toFixed(4)} SOL\n` +
     `<a href="${gmgn(escapeHtml(args.mint))}">GMGN</a>  ·  <a href="${solscan(escapeHtml(args.signature))}">tx ${escapeHtml(short(args.signature))}</a>`;
   return send(text);

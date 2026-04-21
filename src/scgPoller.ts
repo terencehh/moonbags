@@ -1,6 +1,8 @@
 import { CONFIG } from "./config.js";
 import logger from "./logger.js";
 import type { ScgAlert, ScgAlertsResponse } from "./types.js";
+import { getRuntimeSettings } from "./settingsStore.js";
+import { checkSignalMintCooldown, markSignalMintAccepted } from "./sourceDedupe.js";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import path from "node:path";
 
@@ -66,9 +68,13 @@ export function hasSeenAlert(key: string): boolean {
 
 const recentEvents: AlertEvent[] = [];
 
-function recordEvent(e: AlertEvent): void {
+export function recordAlertEvent(e: AlertEvent): void {
   recentEvents.push(e);
   while (recentEvents.length > RECENT_CAP) recentEvents.shift();
+}
+
+function recordEvent(e: AlertEvent): void {
+  recordAlertEvent(e);
 }
 
 export function getRecentAlertEvents(): AlertEvent[] {
@@ -216,6 +222,16 @@ export function startScgPoller(onNew: AlertHandler): () => void {
         const k = alertKey(a);
         if (seen.has(k)) continue;
         remember(k);
+        const settings = getRuntimeSettings();
+        if (settings.signals.sourceMode === "okx_only") {
+          recordEvent({
+            at: Date.now(),
+            mint: a.mint, name: a.name, score: a.score,
+            age_mins: a.age_mins, liquidity: a.liquidity,
+            action: "filtered", reason: "SCG source disabled",
+          });
+          continue;
+        }
         if (paused) {
           recordEvent({
             at: Date.now(),
@@ -249,6 +265,21 @@ export function startScgPoller(onNew: AlertHandler): () => void {
           });
           continue;
         }
+        const cooldown = checkSignalMintCooldown(a.mint, settings.signals.okx.mintCooldownMins);
+        if (!cooldown.ok) {
+          recordEvent({
+            at: Date.now(),
+            mint: a.mint,
+            name: a.name,
+            score: a.score,
+            age_mins: a.age_mins,
+            liquidity: a.liquidity,
+            action: "filtered",
+            reason: cooldown.reason,
+          });
+          continue;
+        }
+        markSignalMintAccepted(a.mint, "scg");
         recordEvent({
           at: Date.now(),
           mint: a.mint,
