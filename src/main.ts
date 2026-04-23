@@ -101,8 +101,8 @@ async function main(): Promise<void> {
   // LLM exit advisor — interval always runs; the gate is inside tickLlmAdvisor()
   // so /llm can toggle at runtime without a restart.
   if (CONFIG.LLM_EXIT_ENABLED) {
-    if (!CONFIG.MINIMAX_API_KEY) {
-      logger.warn("[llm] LLM_EXIT_ENABLED=true but MINIMAX_API_KEY is empty — advisor will skip every position");
+    if (!CONFIG.LLM_API_KEY) {
+      logger.warn("[llm] LLM_EXIT_ENABLED=true but LLM_API_KEY is empty — advisor will skip every position");
     } else {
       logger.info("[llm] exit advisor active (polling every 30s for armed positions)");
     }

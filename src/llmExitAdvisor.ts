@@ -41,6 +41,7 @@ import {
   readLlmTradeRecords,
   type DecisionRecord,
 } from "./llmMemory.js";
+import { CONFIG } from "./config.js";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -132,8 +133,8 @@ type EvidencePacket = {
 // ---------------------------------------------------------------------------
 // Provider config
 // ---------------------------------------------------------------------------
-const MINIMAX_ENDPOINT = "https://api.minimax.io/v1/chat/completions";
-const MINIMAX_MODEL = "MiniMax-M2.7";
+const MINIMAX_ENDPOINT = CONFIG.LLM_ENDPOINT;
+const MINIMAX_MODEL = CONFIG.LLM_MODEL;
 // M2.7 with reasoning_split: true (interleaved thinking) regularly takes
 // 15-25s on convergence-rule reasoning over a rich snapshot. 20s was too
 // tight — about half of consults were hitting this timeout. 45s gives
@@ -1279,9 +1280,9 @@ export async function consultLlm(
   // vectors is "what the LLM is looking at right now".
   recordSnapshot(ctx.mint, snapshot);
 
-  const apiKey = process.env.MINIMAX_API_KEY;
+  const apiKey = CONFIG.LLM_API_KEY;
   if (!apiKey) {
-    logger.warn("[llm] MINIMAX_API_KEY missing — skipping LLM consult");
+    logger.warn("[llm] LLM_API_KEY missing — skipping LLM consult");
     return null;
   }
 

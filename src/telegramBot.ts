@@ -699,7 +699,7 @@ async function sendStartMenu(chatId: number): Promise<void> {
   const open = getPositions().filter((p) => p.status === "open" || p.status === "opening");
 
   const armed = open.filter((p) => p.armed).length;
-  const llmActive = CONFIG.LLM_EXIT_ENABLED && Boolean(CONFIG.MINIMAX_API_KEY);
+  const llmActive = CONFIG.LLM_EXIT_ENABLED && Boolean(CONFIG.LLM_API_KEY);
   const mode = stats.dryRun ? "🧪 DRY" : "🟢 LIVE";
   const pnlIcon = stats.realizedPnlSol >= 0 ? "🟢" : "🔴";
   const pnlSign = stats.realizedPnlSol >= 0 ? "+" : "";
@@ -1728,12 +1728,12 @@ async function handleLlm(chatId: number): Promise<void> {
     return;
   }
   const now = CONFIG.LLM_EXIT_ENABLED;
-  const keySet = Boolean(CONFIG.MINIMAX_API_KEY);
+  const keySet = Boolean(CONFIG.LLM_API_KEY);
   await tgPost("sendMessage", {
     chat_id: chatId,
     text:
       `🧠 LLM advisor: <b>${now ? "🤖 ON" : "⚪️ OFF"}</b>` +
-      (now && !keySet ? `\n⚠️ MINIMAX_API_KEY is empty — LLM will skip every position.` : ""),
+      (now && !keySet ? `\n⚠️ LLM_API_KEY is empty — LLM will skip every position.` : ""),
     parse_mode: "HTML",
   });
   logger.info({ llm: now }, "[telegram] LLM toggled via /llm");

@@ -109,7 +109,13 @@ export const CONFIG = ({
   LLM_EXIT_ENABLED: bool("LLM_EXIT_ENABLED", false),
   LLM_POLL_MS: num("LLM_POLL_MS", 30_000),
   OKX_WSS_ENABLED: bool("OKX_WSS_ENABLED", false),
+  // LLM provider — defaults to MiniMax for backwards compat.
+  // Set LLM_API_KEY + LLM_ENDPOINT + LLM_MODEL to use any OpenAI-compatible
+  // provider (e.g. OpenRouter: https://openrouter.ai/api/v1/chat/completions).
   MINIMAX_API_KEY: str("MINIMAX_API_KEY") ?? "",
+  LLM_API_KEY: str("LLM_API_KEY") ?? str("MINIMAX_API_KEY") ?? "",
+  LLM_ENDPOINT: str("LLM_ENDPOINT") ?? "https://api.minimax.io/v1/chat/completions",
+  LLM_MODEL: str("LLM_MODEL") ?? "MiniMax-M2.7",
   // Milestone alerts — when a position crosses one of these PnL % thresholds
   // on its way up, send a Telegram notification with a force-sell button.
   // Default [100, 200, 500, 1000] = 2x / 3x / 6x / 11x.
