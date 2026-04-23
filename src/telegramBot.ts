@@ -1119,7 +1119,7 @@ async function handleSources(chatId: number, data?: string): Promise<string> {
     if (!isSourceMode(rawMode)) return "Unknown source mode";
     updateRuntimeSettings((draft) => {
       draft.signals.sourceMode = rawMode;
-      draft.signals.okx.enabled = rawMode === "okx_watch" || rawMode === "hybrid" || rawMode === "okx_only";
+      draft.signals.okx.discovery.enabled = rawMode === "okx_watch" || rawMode === "hybrid" || rawMode === "okx_only";
       draft.signals.gmgn.enabled = rawMode === "gmgn_watch" || rawMode === "gmgn_live" || rawMode === "gmgn_only" || rawMode === "hybrid";
     });
     await refreshSafeOkxSignalSource();

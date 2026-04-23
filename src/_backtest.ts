@@ -217,53 +217,49 @@ function pickGmgnNumber(row: GmgnRow, keys: string[]): number | undefined {
   return undefined;
 }
 
-type OkxSignalListRow = {
-  amountUsd?: string;
-  timestamp?: string;
-  triggerWalletCount?: string;
-  walletType?: string;
-  cursor?: string;
-  token?: {
-    holders?: string;
-    marketCapUsd?: string;
-    name?: string;
-    symbol?: string;
-    tokenAddress?: string;
-    top10HolderPercent?: string;
-  };
+type OkxHotTokenRow = {
+  tokenContractAddress?: string;
+  tokenSymbol?: string;
+  marketCap?: string;
+  firstTradeTime?: string;
 };
 
-async function fetchOkxSignals(pages = 2): Promise<TokenSample[]> {
+// Backtest the same universe the live OKX discovery source uses:
+// `onchainos token hot-tokens --rank-by 5 --time-frame 1 --limit 100`
+// (volume-ranked top-100 SOL tokens, 5m window). Matches the live
+// bot — previously this fetched `signal list` (KOL events), a
+// different universe than what the live source now consumes.
+async function fetchOkxSignals(): Promise<TokenSample[]> {
+  const args = [
+    "token", "hot-tokens",
+    "--chain", "solana",
+    "--rank-by", "5",      // volume
+    "--time-frame", "1",   // 5m window (matches live discovery source)
+    "--limit", "100",
+  ];
+  const rows = await runOnchainosJson<OkxHotTokenRow[]>(args, 15_000).catch(() => null);
+  if (!rows || rows.length === 0) {
+    throw new Error(
+      "OKX hot-tokens returned no tokens. Check onchainos CLI auth and `onchainos token hot-tokens --chain solana --rank-by 5 --time-frame 1 --limit 1`.",
+    );
+  }
   const seen = new Set<string>();
   const out: TokenSample[] = [];
-  let cursor: string | undefined;
-  for (let p = 0; p < pages; p++) {
-    const args = ["signal", "list", "--chain", "solana", "--limit", "100"];
-    if (cursor) args.push("--cursor", cursor);
-    const rows = await runOnchainosJson<OkxSignalListRow[]>(args, 15_000).catch(() => null);
-    if (!rows || rows.length === 0) break;
-    for (const row of rows) {
-      const mint = row.token?.tokenAddress ?? "";
-      if (!mint || seen.has(mint)) continue;
-      seen.add(mint);
-      const ts = Number(row.timestamp);
-      const alertTimeSec = Number.isFinite(ts) && ts > 0
-        ? (ts > 1e12 ? Math.floor(ts / 1000) : Math.floor(ts))
-        : undefined;
-      out.push({
-        address: mint,
-        symbol: row.token?.symbol ?? row.token?.name ?? mint.slice(0, 6),
-        alertTimeSec,
-        alertMcap: Number(row.token?.marketCapUsd) || undefined,
-        source: "okx",
-      });
-    }
-    cursor = rows[rows.length - 1]?.cursor;
-    if (!cursor) break;
-    await new Promise((r) => setTimeout(r, 200));
-  }
-  if (out.length === 0) {
-    throw new Error("OKX signal list returned no tokens. Check onchainos CLI auth and `onchainos signal list --chain solana --limit 1`.");
+  for (const row of rows) {
+    const mint = row.tokenContractAddress ?? "";
+    if (!mint || seen.has(mint)) continue;
+    seen.add(mint);
+    const tsMs = Number(row.firstTradeTime);
+    const alertTimeSec = Number.isFinite(tsMs) && tsMs > 0
+      ? (tsMs > 1e12 ? Math.floor(tsMs / 1000) : Math.floor(tsMs))
+      : undefined;
+    out.push({
+      address: mint,
+      symbol: row.tokenSymbol ?? mint.slice(0, 6),
+      alertTimeSec,
+      alertMcap: Number(row.marketCap) || undefined,
+      source: "okx",
+    });
   }
   return out;
 }
