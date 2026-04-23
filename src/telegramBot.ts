@@ -764,7 +764,10 @@ async function handleCallback(cq: NonNullable<Update["callback_query"]>): Promis
       callback_query_id: cq.id,
       text: `${SETTINGS_LABELS[key]}: ${SETTABLE_SPECS[key].display(v)}`,
     });
-    await sendSettingsMenu(chatId);  // refresh menu so they see the new state
+    // Re-show the same Live Settings menu they tapped from, not the parent
+    // menu — otherwise tapping Toggle LLM advisor appears to drop them back
+    // to the top-level Settings screen.
+    await sendAllSettingsMenu(chatId);
     logger.info({ key, value: v }, "[settings] toggled via telegram");
     return;
   }
