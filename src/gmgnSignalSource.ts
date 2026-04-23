@@ -1514,8 +1514,12 @@ async function runCycle(): Promise<void> {
     const firstPoll = await persistAndMaybeSeed(seeds, settings, "scanner");
     if (firstPoll) return;
 
+    // shouldProcessSeed was already applied inside fetchSeeds. Do NOT
+    // re-check in this loop — persistAndMaybeSeed above just upserted
+    // each seed's sourceKey into the watchlist, which would make
+    // shouldProcessSeed return false for every seed and silently skip
+    // all processing.
     for (const seed of seeds) {
-      if (!shouldProcessSeed(seed)) continue;
       try {
         // Trending seeds from /v1/market/rank include a full profile
         // (holder_count, smart_degen_count, renowned_count, liquidity,
