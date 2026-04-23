@@ -117,6 +117,7 @@ export type RuntimeSettings = {
       trigger: {
         minScans: number;
         minHolderGrowthPct: number;
+        maxHolderGrowthPct: number;
         maxLiquidityDropPct: number;
         minBuySellRatio: number;
         minSmartOrKolCount: number;
@@ -277,6 +278,7 @@ function defaultSettings(): RuntimeSettings {
         trigger: {
           minScans: 2,
           minHolderGrowthPct: 5,
+          maxHolderGrowthPct: 0,
           maxLiquidityDropPct: 30,
           minBuySellRatio: 1.15,
           minSmartOrKolCount: 1,
@@ -508,6 +510,7 @@ function normalizeSettings(raw: unknown): RuntimeSettings {
         trigger: {
           minScans: Math.round(num(gmgnTrigger.minScans, defaults.signals.gmgn.trigger.minScans, 1, 20)),
           minHolderGrowthPct: num(gmgnTrigger.minHolderGrowthPct, defaults.signals.gmgn.trigger.minHolderGrowthPct, 0, 1000),
+          maxHolderGrowthPct: num(gmgnTrigger.maxHolderGrowthPct, defaults.signals.gmgn.trigger.maxHolderGrowthPct, 0, 10000),
           maxLiquidityDropPct: num(gmgnTrigger.maxLiquidityDropPct, defaults.signals.gmgn.trigger.maxLiquidityDropPct, 0, 100),
           minBuySellRatio: num(gmgnTrigger.minBuySellRatio, defaults.signals.gmgn.trigger.minBuySellRatio, 0, 1000),
           minSmartOrKolCount: Math.round(num(gmgnTrigger.minSmartOrKolCount, defaults.signals.gmgn.trigger.minSmartOrKolCount, 0, 1000)),

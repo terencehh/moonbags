@@ -82,6 +82,7 @@ type GmgnSettings = {
   trigger: {
     minScans: number;
     minHolderGrowthPct: number;
+    maxHolderGrowthPct: number;
     maxLiquidityDropPct: number;
     minBuySellRatio: number;
     minSmartOrKolCount: number;
@@ -269,6 +270,7 @@ const DEFAULT_SETTINGS: GmgnSettings = {
   trigger: {
     minScans: 2,
     minHolderGrowthPct: 5,
+    maxHolderGrowthPct: 0,
     maxLiquidityDropPct: 30,
     minBuySellRatio: 1.15,
     minSmartOrKolCount: 1,
@@ -426,6 +428,7 @@ function currentSettings(): GmgnSettings {
     trigger: {
       minScans: Math.max(1, Math.min(20, Math.round(finite(trigger.minScans, DEFAULT_SETTINGS.trigger.minScans)))),
       minHolderGrowthPct: Math.max(0, finite(trigger.minHolderGrowthPct, DEFAULT_SETTINGS.trigger.minHolderGrowthPct)),
+      maxHolderGrowthPct: Math.max(0, finite(trigger.maxHolderGrowthPct, DEFAULT_SETTINGS.trigger.maxHolderGrowthPct)),
       maxLiquidityDropPct: Math.max(0, Math.min(100, finite(trigger.maxLiquidityDropPct, DEFAULT_SETTINGS.trigger.maxLiquidityDropPct))),
       minBuySellRatio: Math.max(0, finite(trigger.minBuySellRatio, DEFAULT_SETTINGS.trigger.minBuySellRatio)),
       minSmartOrKolCount: Math.max(0, Math.round(finite(trigger.minSmartOrKolCount, DEFAULT_SETTINGS.trigger.minSmartOrKolCount))),
@@ -675,6 +678,9 @@ function maybeRejectTrigger(candidate: GmgnSignalCandidate, settings: GmgnSettin
   const holderGrowthPct = firstHolders > 0 ? ((candidate.holders - firstHolders) / firstHolders) * 100 : 0;
   if (holderGrowthPct < trigger.minHolderGrowthPct) {
     return `holder growth ${holderGrowthPct.toFixed(1)}% < ${trigger.minHolderGrowthPct}%`;
+  }
+  if (trigger.maxHolderGrowthPct > 0 && holderGrowthPct > trigger.maxHolderGrowthPct) {
+    return `holder growth ${holderGrowthPct.toFixed(1)}% > ${trigger.maxHolderGrowthPct}% (bot inflation)`;
   }
 
   const firstLiquidity = existing?.firstLiquidityUsd ?? candidate.liquidityUsd;
