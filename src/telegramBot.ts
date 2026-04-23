@@ -19,8 +19,8 @@ import { getPositionSnapshot } from "./okxClient.js";
 import { getOkxWsStatus, unwatchOkxWsMint, watchOkxWsMint } from "./okxWsService.js";
 import { escapeHtml } from "./notifier.js";
 import { runBacktest, type BacktestTpTarget } from "./_backtest.js";
-import { runOkxFilterAnalysis, type OkxFilterAnalysisResult, type SweepResult as OkxSweepResult } from "./_okxFilterAnalysis.js";
-import { runGmgnFilterAnalysis, type GmgnFilterAnalysisResult, type GmgnSweepResult } from "./_gmgnFilterAnalysis.js";
+import { runOkxFilterAnalysis, type OkxFilterAnalysisResult, type SweepResult as OkxSweepResult, type CategoricalSweepResult as OkxCategoricalSweepResult } from "./_okxFilterAnalysis.js";
+import { runGmgnFilterAnalysis, type GmgnFilterAnalysisResult, type GmgnSweepResult, type GmgnCategoricalSweepResult } from "./_gmgnFilterAnalysis.js";
 import {
   getUpdateBlockerDetails,
   getUpdatePreview,
@@ -66,6 +66,11 @@ type Update = {
 const pendingEdits = new Map<number, SettableKey>();
 type ExitTargetEdit = { kind: "tp_targets" };
 const pendingExitEdits = new Map<number, ExitTargetEdit>();
+
+// Runtime (state/settings.json) settings that live outside SETTABLE_SPECS. The
+// Live Settings menu renders these as extra rows with their own callbacks.
+type RuntimeSettableKey = "JUP_GATE_ENABLED" | "JUP_GATE_MIN_FEES" | "JUP_GATE_SCORE_LABELS";
+const pendingRuntimeEdits = new Map<number, RuntimeSettableKey>();
 
 const EXIT_STRATEGY_LABELS: Record<ExitStrategyMode, string> = {
   trail: "🌙 Trail",
@@ -437,13 +442,28 @@ async function sendAllSettingsMenu(chatId: number): Promise<void> {
     return `${SETTINGS_LABELS[k]}: <b>${spec.display(v)}</b>`;
   });
 
-  const buttons = keys.map((k): [{ text: string; callback_data: string }] => {
+  const buttons: Array<Array<{ text: string; callback_data: string }>> = keys.map((k) => {
     const spec = SETTABLE_SPECS[k];
     if (spec.type === "boolean") {
       return [{ text: `Toggle ${SETTINGS_LABELS[k]}`, callback_data: `toggle:${k}` }];
     }
     return [{ text: `Edit ${SETTINGS_LABELS[k]}`, callback_data: `edit:${k}` }];
   });
+
+  // jupGate lives in runtime settings (state/settings.json), not env, so it
+  // isn't in SETTABLE_SPECS. Append it as three separate rows here so users
+  // can tune it from the same Live Settings screen.
+  const jupCfg = getRuntimeSettings().jupGate;
+  const jupEnabledDisplay = jupCfg.enabled ? "on" : "off";
+  const jupLabelsDisplay = jupCfg.allowedScoreLabels.length > 0
+    ? jupCfg.allowedScoreLabels.join(",")
+    : "(any)";
+  lines.push(`🔍 Jup gate: <b>${escapeHtml(jupEnabledDisplay)}</b>`);
+  lines.push(`🔍 Jup minFees: <b>${jupCfg.minFees}</b>`);
+  lines.push(`🔍 Jup score labels: <b>${escapeHtml(jupLabelsDisplay)}</b>`);
+  buttons.push([{ text: `Toggle 🔍 Jup gate`, callback_data: "toggle:JUP_GATE_ENABLED" }]);
+  buttons.push([{ text: `Edit 🔍 Jup minFees`, callback_data: "edit:JUP_GATE_MIN_FEES" }]);
+  buttons.push([{ text: `Edit 🔍 Jup score labels`, callback_data: "edit:JUP_GATE_SCORE_LABELS" }]);
 
   await tgPost("sendMessage", {
     chat_id: chatId,
@@ -505,6 +525,88 @@ async function applyEdit(chatId: number, key: SettableKey, raw: string): Promise
     parse_mode: "HTML",
   });
   logger.info({ key, value: v }, "[settings] updated via telegram");
+}
+
+// Runtime-settings (jupGate) edit prompt/apply. jupGate lives in
+// state/settings.json — not env — so it has a different persistence path
+// via updateRuntimeSettings.
+const RUNTIME_EDIT_LABELS: Record<RuntimeSettableKey, string> = {
+  JUP_GATE_ENABLED: "🔍 Jup gate",
+  JUP_GATE_MIN_FEES: "🔍 Jup minFees",
+  JUP_GATE_SCORE_LABELS: "🔍 Jup score labels",
+};
+
+function formatRuntimeCurrent(key: RuntimeSettableKey): string {
+  const cfg = getRuntimeSettings().jupGate;
+  if (key === "JUP_GATE_ENABLED") return cfg.enabled ? "on" : "off";
+  if (key === "JUP_GATE_MIN_FEES") return String(cfg.minFees);
+  const labels = cfg.allowedScoreLabels;
+  return labels.length > 0 ? labels.join(",") : "(any)";
+}
+
+async function promptForRuntimeEdit(chatId: number, key: RuntimeSettableKey): Promise<void> {
+  const current = formatRuntimeCurrent(key);
+  const hint = key === "JUP_GATE_MIN_FEES"
+    ? `(number — e.g. 1 or 0.5)`
+    : key === "JUP_GATE_SCORE_LABELS"
+      ? `(comma-separated — e.g. "medium,high" or leave empty for any)`
+      : "";
+  const resp = await tgPost("sendMessage", {
+    chat_id: chatId,
+    text:
+      `Reply with the new value for <b>${RUNTIME_EDIT_LABELS[key]}</b>\n` +
+      `Current: <b>${escapeHtml(current)}</b>  ${hint}`,
+    parse_mode: "HTML",
+    reply_markup: { force_reply: true, selective: true },
+  }) as { ok?: boolean; result?: { message_id?: number } };
+
+  const promptId = resp?.result?.message_id;
+  if (typeof promptId === "number") {
+    pendingRuntimeEdits.set(promptId, key);
+    setTimeout(() => pendingRuntimeEdits.delete(promptId), 5 * 60_000).unref?.();
+  }
+}
+
+async function applyRuntimeEdit(chatId: number, key: RuntimeSettableKey, raw: string): Promise<void> {
+  const trimmed = raw.trim();
+  try {
+    if (key === "JUP_GATE_MIN_FEES") {
+      const n = Number(trimmed);
+      if (!Number.isFinite(n) || n < 0) {
+        await tgPost("sendMessage", { chat_id: chatId, text: `❌ Could not update <b>${RUNTIME_EDIT_LABELS[key]}</b>: expected a non-negative number`, parse_mode: "HTML" });
+        return;
+      }
+      updateRuntimeSettings((draft) => { draft.jupGate.minFees = n; });
+    } else if (key === "JUP_GATE_SCORE_LABELS") {
+      // Parse comma-separated list; trim + lowercase + filter empty. Empty
+      // string -> empty array (= "any label allowed").
+      const labels = trimmed.length === 0
+        ? []
+        : trimmed.split(",").map((s) => s.trim().toLowerCase()).filter((s) => s.length > 0);
+      updateRuntimeSettings((draft) => { draft.jupGate.allowedScoreLabels = labels; });
+    } else {
+      // JUP_GATE_ENABLED — shouldn't be routed here (it's a toggle), but
+      // accept truthy/falsy text as a fallback.
+      const on = /^(1|true|on|yes|y)$/i.test(trimmed);
+      const off = /^(0|false|off|no|n)$/i.test(trimmed);
+      if (!on && !off) {
+        await tgPost("sendMessage", { chat_id: chatId, text: `❌ Could not update <b>${RUNTIME_EDIT_LABELS[key]}</b>: expected on/off`, parse_mode: "HTML" });
+        return;
+      }
+      updateRuntimeSettings((draft) => { draft.jupGate.enabled = on; });
+    }
+  } catch (err) {
+    await tgPost("sendMessage", { chat_id: chatId, text: `❌ Could not update <b>${RUNTIME_EDIT_LABELS[key]}</b>: ${escapeHtml((err as Error).message)}`, parse_mode: "HTML" });
+    return;
+  }
+
+  const current = formatRuntimeCurrent(key);
+  await tgPost("sendMessage", {
+    chat_id: chatId,
+    text: `✅ <b>${RUNTIME_EDIT_LABELS[key]}</b> → <b>${escapeHtml(current)}</b>\n<i>Saved to state/settings.json. Live now.</i>`,
+    parse_mode: "HTML",
+  });
+  logger.info({ key, value: current }, "[settings] runtime setting updated via telegram");
 }
 
 async function sendStartMenu(chatId: number): Promise<void> {
@@ -738,7 +840,14 @@ async function handleCallback(cq: NonNullable<Update["callback_query"]>): Promis
   }
 
   if (data.startsWith("edit:")) {
-    const key = data.slice(5) as SettableKey;
+    const rawKey = data.slice(5);
+    // Route runtime-settings edits (jupGate) separately from SETTABLE_SPECS.
+    if (rawKey === "JUP_GATE_MIN_FEES" || rawKey === "JUP_GATE_SCORE_LABELS" || rawKey === "JUP_GATE_ENABLED") {
+      await tgPost("answerCallbackQuery", { callback_query_id: cq.id });
+      await promptForRuntimeEdit(chatId, rawKey);
+      return;
+    }
+    const key = rawKey as SettableKey;
     if (key in SETTABLE_SPECS) {
       await tgPost("answerCallbackQuery", { callback_query_id: cq.id });
       await promptForEdit(chatId, key);
@@ -749,7 +858,20 @@ async function handleCallback(cq: NonNullable<Update["callback_query"]>): Promis
   }
 
   if (data.startsWith("toggle:")) {
-    const key = data.slice(7) as SettableKey;
+    const rawKey = data.slice(7);
+    // Route jupGate toggle separately — it lives in runtime settings, not env.
+    if (rawKey === "JUP_GATE_ENABLED") {
+      updateRuntimeSettings((draft) => { draft.jupGate.enabled = !draft.jupGate.enabled; });
+      const after = getRuntimeSettings().jupGate.enabled;
+      await tgPost("answerCallbackQuery", {
+        callback_query_id: cq.id,
+        text: `🔍 Jup gate: ${after ? "on" : "off"}`,
+      });
+      await sendAllSettingsMenu(chatId);
+      logger.info({ key: rawKey, value: after }, "[settings] runtime setting toggled via telegram");
+      return;
+    }
+    const key = rawKey as SettableKey;
     if (!(key in SETTABLE_SPECS) || SETTABLE_SPECS[key].type !== "boolean") {
       await tgPost("answerCallbackQuery", { callback_query_id: cq.id, text: "Unknown toggle" });
       return;
@@ -1997,18 +2119,31 @@ let filterSweepInFlight = false;
 // Adopt-baseline state: registerFilterAdopt stashes the suggested baseline
 // under a short key; the "adopt:filter:<key>" callback reads it and applies
 // it via updateRuntimeSettings. Keys expire after 1h to avoid leaking.
-type PendingFilterAdopt = { source: "okx" | "gmgn"; baseline: Record<string, number>; at: number };
+// `baseline` holds the source-specific baseline numeric fields (flat
+// key → number, e.g. minHolders). `jupGate` carries cross-source jup-gate
+// suggestions to write into draft.jupGate.* alongside baseline.
+type JupGateAdoptPayload = { minFees?: number; allowedScoreLabels?: string[] };
+type PendingFilterAdopt = {
+  source: "okx" | "gmgn";
+  baseline: Record<string, number>;
+  jupGate: JupGateAdoptPayload;
+  at: number;
+};
 const pendingFilterAdopts = new Map<string, PendingFilterAdopt>();
 const FILTER_ADOPT_TTL_MS = 60 * 60 * 1000;
 
-function registerFilterAdopt(source: "okx" | "gmgn", baseline: Record<string, number>): string {
+function registerFilterAdopt(
+  source: "okx" | "gmgn",
+  baseline: Record<string, number>,
+  jupGate: JupGateAdoptPayload,
+): string {
   // Prune expired entries cheaply on every registration.
   const now = Date.now();
   for (const [k, v] of pendingFilterAdopts) {
     if (now - v.at > FILTER_ADOPT_TTL_MS) pendingFilterAdopts.delete(k);
   }
   const key = Math.random().toString(36).slice(2, 10);
-  pendingFilterAdopts.set(key, { source, baseline, at: now });
+  pendingFilterAdopts.set(key, { source, baseline, jupGate, at: now });
   return key;
 }
 
@@ -2056,6 +2191,85 @@ function normalizeGmgnSweeps(sweeps: GmgnSweepResult[]): NormalizedSweep[] {
       medMin: r.medianMinPnl,
     })),
   }));
+}
+
+// Normalized categorical sweep (jup label sets). Structure-compatible between
+// okx / gmgn so formatters + adopt picker are source-agnostic.
+type NormalizedCategoricalSweep = {
+  field: string;
+  label: string;
+  options: Array<{
+    id: string;
+    label: string;
+    allowedLabels: string[];
+    n: number;
+    winPct: number;
+    medMax: number;
+    medFinal: number;
+    medMin: number;
+  }>;
+};
+
+function normalizeOkxCategorical(results: OkxCategoricalSweepResult[]): NormalizedCategoricalSweep[] {
+  return results.map((s) => ({
+    field: s.field,
+    label: s.label,
+    options: s.options.map((o) => ({
+      id: o.id,
+      label: o.label,
+      allowedLabels: o.allowedLabels,
+      n: o.n,
+      winPct: o.winPct,
+      medMax: o.medianMaxPnl,
+      medFinal: o.medianFinalPnl,
+      medMin: o.medianMinPnl,
+    })),
+  }));
+}
+
+function normalizeGmgnCategorical(results: GmgnCategoricalSweepResult[]): NormalizedCategoricalSweep[] {
+  return results.map((s) => ({
+    field: s.field,
+    label: s.label,
+    options: s.options.map((o) => ({
+      id: o.id,
+      label: o.label,
+      allowedLabels: o.allowedLabels,
+      n: o.n,
+      winPct: o.winPct,
+      medMax: o.medianMaxPnl,
+      medFinal: o.medianFinalPnl,
+      medMin: o.medianMinPnl,
+    })),
+  }));
+}
+
+function formatCategoricalBlock(sweep: NormalizedCategoricalSweep): string {
+  const lines: string[] = [];
+  lines.push(sweep.label);
+  // Show every option (small set) with summary stats.
+  for (const o of sweep.options) {
+    const labelSet = o.allowedLabels.length > 0 ? `[${o.allowedLabels.join("|")}]` : "[any]";
+    lines.push(
+      `  ${o.id.padEnd(12)} ${labelSet.padEnd(18)} n=${o.n} win% ${o.winPct.toFixed(0)} medMax ${fmtPctSigned(o.medMax)} medFinal ${fmtPctSigned(o.medFinal)} medMin ${fmtPctSigned(o.medMin)}`,
+    );
+  }
+  return lines.join("\n");
+}
+
+// Pick the option with highest winPct & n >= minN. Returns the allowedLabels
+// set (possibly empty = "any"), or null if nothing passes the n floor.
+function bestCategoricalOption(
+  sweep: NormalizedCategoricalSweep,
+  minN: number,
+): string[] | null {
+  const eligible = sweep.options.filter((o) => o.n >= minN);
+  if (eligible.length === 0) return null;
+  eligible.sort((a, b) => {
+    if (b.winPct !== a.winPct) return b.winPct - a.winPct;
+    return b.n - a.n;
+  });
+  return eligible[0]!.allowedLabels;
 }
 
 function formatSweepBlock(sweep: NormalizedSweep): string {
@@ -2186,6 +2400,7 @@ async function handleFilterSweep(chatId: number, source: "gmgn" | "okx"): Promis
     let withOhlcv = 0;
     let csvPath = "";
     let normalizedSweeps: NormalizedSweep[] = [];
+    let normalizedCategorical: NormalizedCategoricalSweep[] = [];
     let byTimeFrame: Array<{ tfLabel: string; n: number; winPct: number }> = [];
     let baselineKeyPrefix = "";
     let fieldMap: Record<string, string> = {};
@@ -2198,6 +2413,7 @@ async function handleFilterSweep(chatId: number, source: "gmgn" | "okx"): Promis
       withOhlcv = result.withOhlcv;
       csvPath = result.csvPath;
       normalizedSweeps = normalizeOkxSweeps(result.sweeps);
+      normalizedCategorical = normalizeOkxCategorical(result.sweepsCategorical ?? []);
       byTimeFrame = result.byTimeFrame.map((t) => ({ tfLabel: t.tfLabel, n: t.n, winPct: t.winPct }));
       baselineKeyPrefix = "signals.okx.discovery.baseline";
       fieldMap = OKX_FIELD_TO_BASELINE_KEY;
@@ -2209,6 +2425,7 @@ async function handleFilterSweep(chatId: number, source: "gmgn" | "okx"): Promis
       withOhlcv = result.withOhlcv;
       csvPath = result.csvPath;
       normalizedSweeps = normalizeGmgnSweeps(result.sweeps);
+      normalizedCategorical = normalizeGmgnCategorical(result.sweepsCategorical ?? []);
       byTimeFrame = result.byTimeFrame.map((t) => ({ tfLabel: t.tfLabel, n: t.n, winPct: t.winPct }));
       baselineKeyPrefix = "signals.gmgn.baseline";
       fieldMap = GMGN_FIELD_TO_BASELINE_KEY;
@@ -2248,22 +2465,57 @@ async function handleFilterSweep(chatId: number, source: "gmgn" | "okx"): Promis
     }
 
     // Sweep <pre> blocks — each shows top 3 thresholds by winPct.
-    const sweepBlocks = normalizedSweeps.map((s) => formatSweepBlock(s));
+    // Render fees sweep (jupGate) at the end alongside the categorical
+    // label sweep for better readability.
+    const mainSweeps = normalizedSweeps.filter((s) => s.field !== "fees");
+    const feesSweeps = normalizedSweeps.filter((s) => s.field === "fees");
+    const sweepBlocks = mainSweeps.map((s) => formatSweepBlock(s));
+    const jupSweepBlocks: string[] = [
+      ...feesSweeps.map((s) => formatSweepBlock(s)),
+      ...normalizedCategorical.map((c) => formatCategoricalBlock(c)),
+    ];
 
     // Suggested baseline
     const suggested = buildSuggestedBaseline(normalizedSweeps, fieldMap, 20);
     const suggestedKeys = Object.keys(suggested);
+
+    // Jup-gate suggestions: minFees from the fees sweep + allowedScoreLabels
+    // from the categorical sweep. Both demand n >= 20 to match the main
+    // baseline picker.
+    const feesSweep = feesSweeps[0];
+    const bestFees = feesSweep ? bestThresholdFor(feesSweep, 20) : null;
+    const labelsSweep = normalizedCategorical[0];
+    const bestLabels = labelsSweep ? bestCategoricalOption(labelsSweep, 20) : null;
+
+    const jupGatePayload: JupGateAdoptPayload = {};
+    const jupGateDisplay: Record<string, unknown> = {};
+    // Skip trivial threshold 0 (= "no filter") for fees, matching the
+    // baseline builder's behaviour for direction=min.
+    if (bestFees !== null && bestFees > 0) {
+      jupGatePayload.minFees = bestFees;
+      jupGateDisplay["jupGate.minFees"] = bestFees;
+    }
+    if (bestLabels !== null) {
+      jupGatePayload.allowedScoreLabels = bestLabels;
+      jupGateDisplay["jupGate.allowedScoreLabels"] = bestLabels;
+    }
+    const hasJupGateSuggestion = Object.keys(jupGatePayload).length > 0;
+
     const suggestedLines: string[] = [];
-    suggestedLines.push(`<b>Suggested baseline</b> (paste into <code>${escapeHtml(baselineKeyPrefix)}</code>)`);
-    if (suggestedKeys.length === 0) {
+    suggestedLines.push(`<b>Suggested baseline + Jup gate</b> (paste into <code>${escapeHtml(baselineKeyPrefix)}</code> + <code>jupGate</code>)`);
+    if (suggestedKeys.length === 0 && !hasJupGateSuggestion) {
       suggestedLines.push(`<i>No sweep cleared the n≥20 floor — not enough data.</i>`);
     } else {
-      suggestedLines.push(`<pre>${escapeHtml(JSON.stringify(suggested, null, 2))}</pre>`);
+      const combined: Record<string, unknown> = { ...suggested, ...jupGateDisplay };
+      suggestedLines.push(`<pre>${escapeHtml(JSON.stringify(combined, null, 2))}</pre>`);
     }
 
     // First message: header + first batch of sweeps.
     const headerText = header.join("\n");
     const preChunks = splitIntoChunks(sweepBlocks, "<pre>", "</pre>");
+    const jupPreChunks = jupSweepBlocks.length > 0
+      ? splitIntoChunks(jupSweepBlocks, "<pre>", "</pre>")
+      : [];
     const suggestedText = suggestedLines.join("\n");
 
     // Try to fit first <pre> chunk into the status-edit message alongside the
@@ -2300,8 +2552,19 @@ async function handleFilterSweep(chatId: number, source: "gmgn" | "okx"): Promis
       });
     }
 
-    if (suggestedKeys.length > 0) {
-      const adoptKey = registerFilterAdopt(source, suggested);
+    // Jup-gate blocks (fees sweep + categorical label sweep) rendered at the
+    // end so they don't get buried in the baseline sweep list.
+    for (const chunk of jupPreChunks) {
+      await tgPost("sendMessage", {
+        chat_id: chatId,
+        text: chunk,
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+      });
+    }
+
+    if (suggestedKeys.length > 0 || hasJupGateSuggestion) {
+      const adoptKey = registerFilterAdopt(source, suggested, jupGatePayload);
       await tgPost("sendMessage", {
         chat_id: chatId,
         text: suggestedText,
@@ -2309,7 +2572,7 @@ async function handleFilterSweep(chatId: number, source: "gmgn" | "okx"): Promis
         disable_web_page_preview: true,
         reply_markup: {
           inline_keyboard: [[
-            { text: `✅ Adopt ${sourceLabel} baseline`, callback_data: `adopt:filter:${adoptKey}` },
+            { text: `✅ Adopt ${sourceLabel} baseline + Jup gate`, callback_data: `adopt:filter:${adoptKey}` },
           ]],
         },
       });
@@ -2495,7 +2758,7 @@ async function handleAdopt(chatId: number, data: string): Promise<void> {
       return;
     }
     pendingFilterAdopts.delete(key!);
-    const { source, baseline } = entry;
+    const { source, baseline, jupGate } = entry;
     const sourceLabel = source === "okx" ? "OKX" : "GMGN";
     updateRuntimeSettings((draft) => {
       if (source === "okx") {
@@ -2505,19 +2768,34 @@ async function handleAdopt(chatId: number, data: string): Promise<void> {
         const target = draft.signals.gmgn.baseline as unknown as Record<string, number>;
         for (const [k, v] of Object.entries(baseline)) target[k] = v;
       }
+      // Jup gate is cross-source; apply whichever fields were suggested.
+      if (typeof jupGate.minFees === "number") {
+        draft.jupGate.minFees = jupGate.minFees;
+      }
+      if (Array.isArray(jupGate.allowedScoreLabels)) {
+        draft.jupGate.allowedScoreLabels = jupGate.allowedScoreLabels;
+      }
     });
-    const applied = Object.entries(baseline)
-      .map(([k, v]) => `  ${k}: ${v}`)
-      .join("\n");
+    const appliedLines = Object.entries(baseline).map(([k, v]) => `  ${k}: ${v}`);
+    if (typeof jupGate.minFees === "number") {
+      appliedLines.push(`  jupGate.minFees: ${jupGate.minFees}`);
+    }
+    if (Array.isArray(jupGate.allowedScoreLabels)) {
+      const labelsText = jupGate.allowedScoreLabels.length > 0
+        ? JSON.stringify(jupGate.allowedScoreLabels)
+        : "[] (any)";
+      appliedLines.push(`  jupGate.allowedScoreLabels: ${labelsText}`);
+    }
+    const applied = appliedLines.join("\n");
     await tgPost("sendMessage", {
       chat_id: chatId,
       text:
-        `✅ <b>Adopted ${sourceLabel} baseline</b>\n` +
+        `✅ <b>Adopted ${sourceLabel} baseline + Jup gate</b>\n` +
         `<pre>${escapeHtml(applied)}</pre>\n` +
         `Applied live, persisted to state/settings.json.`,
       parse_mode: "HTML",
     });
-    logger.info({ source, applied: baseline }, "[settings] filter-sweep baseline adopted");
+    logger.info({ source, applied: baseline, jupGate }, "[settings] filter-sweep baseline adopted");
     return;
   }
   if (parts[1] === "fixed") {
@@ -2878,6 +3156,12 @@ export function startTelegramBot(): () => void {
             const key = pendingEdits.get(replyToId)!;
             pendingEdits.delete(replyToId);
             await applyEdit(chatId, key, text);
+            continue;
+          }
+          if (replyToId !== undefined && pendingRuntimeEdits.has(replyToId)) {
+            const key = pendingRuntimeEdits.get(replyToId)!;
+            pendingRuntimeEdits.delete(replyToId);
+            await applyRuntimeEdit(chatId, key, text);
             continue;
           }
 

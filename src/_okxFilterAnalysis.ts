@@ -20,6 +20,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { fetchJupAudit } from "./jupGate.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -72,6 +73,9 @@ type Candidate = {
   vibeScore: number;
   riskLevel: number;
   tokenAgeHours: number;
+  // Jup-gate audit fields (fetched before klines; transient failures default to 0/"")
+  fees: number;
+  organicScoreLabel: string;
   // Forward-PnL fields (computed later)
   hasOhlcv: boolean;
   candleCount: number;
@@ -152,6 +156,8 @@ async function harvestHotTokens(timeFrames: string[]): Promise<Candidate[]> {
         vibeScore: num(row.vibeScore),
         riskLevel: Math.round(num(row.riskLevelControl)),
         tokenAgeHours,
+        fees: 0,
+        organicScoreLabel: "",
         hasOhlcv: false,
         candleCount: 0,
         entryPrice: 0,
@@ -233,11 +239,30 @@ export type SweepResult = {
 
 export type TimeFrameSummary = SweepSummary & { tfLabel: string };
 
+// Categorical sweep: each option describes a required label set. "any" keeps
+// everything, "medium|high" keeps tokens labeled medium or high, "high"
+// keeps only high-scored tokens. Adopt maps the winning option back to
+// jupGate.allowedScoreLabels.
+export type CategoricalSweepOption = SweepSummary & {
+  id: string;
+  label: string;
+  allowedLabels: string[];
+  kept: number;
+  dropped: number;
+};
+
+export type CategoricalSweepResult = {
+  field: string;
+  label: string;
+  options: CategoricalSweepOption[];
+};
+
 export type OkxFilterAnalysisResult = {
   totalTokens: number;
   withOhlcv: number;
   byTimeFrame: TimeFrameSummary[];
   sweeps: SweepResult[];
+  sweepsCategorical: CategoricalSweepResult[];
   csvPath: string;
 };
 
@@ -305,7 +330,31 @@ const OKX_SWEEP_SPECS: Array<{ label: string; field: keyof Candidate; thresholds
   { label: "volumeUsd (hot-tokens window)", field: "volumeUsd", thresholds: [0, 10_000, 50_000, 250_000, 1_000_000], dir: "min" },
   { label: "priceChangePct (already pumping?)", field: "priceChangePct", thresholds: [0, 5, 10, 25, 50], dir: "min" },
   { label: "tokenAgeHours (filter out fresh rugs)", field: "tokenAgeHours", thresholds: [0, 1, 6, 24, 72, 168], dir: "min" },
+  { label: "fees (jupGate.minFees)", field: "fees", thresholds: [0, 0.1, 0.5, 1, 2, 5, 10, 25, 50], dir: "min" },
 ];
+
+// Categorical sweep over Jup organicScoreLabel. Represented as a set of
+// allowed-label options so adopt can pick the highest-winrate set.
+const JUP_LABEL_OPTIONS: Array<{ id: string; label: string; allowedLabels: string[] }> = [
+  { id: "any", label: "any label (no filter)", allowedLabels: [] },
+  { id: "medium_high", label: "medium or high", allowedLabels: ["medium", "high"] },
+  { id: "high", label: "high only", allowedLabels: ["high"] },
+];
+
+function computeCategoricalSweep(cs: Candidate[]): CategoricalSweepResult {
+  const options: CategoricalSweepOption[] = JUP_LABEL_OPTIONS.map((opt) => {
+    const allowLower = opt.allowedLabels.map((l) => l.toLowerCase());
+    const kept = cs.filter((c) => {
+      if (allowLower.length === 0) return true;
+      const normalized = c.organicScoreLabel.toLowerCase();
+      return normalized.length > 0 && allowLower.includes(normalized);
+    });
+    const dropped = cs.length - kept.length;
+    const s = summarizeGroup(kept);
+    return { id: opt.id, label: opt.label, allowedLabels: opt.allowedLabels, kept: kept.length, dropped, ...s };
+  });
+  return { field: "organicScoreLabel", label: "organicScoreLabel (jupGate.allowedScoreLabels)", options };
+}
 
 export async function runOkxFilterAnalysis(opts?: {
   timeFrames?: string[];
@@ -324,6 +373,7 @@ export async function runOkxFilterAnalysis(opts?: {
       withOhlcv: 0,
       byTimeFrame: [],
       sweeps: [],
+      sweepsCategorical: [],
       csvPath: "",
     };
   }
@@ -331,6 +381,17 @@ export async function runOkxFilterAnalysis(opts?: {
   let withOhlcv = 0;
   for (let i = 0; i < cs.length; i++) {
     const c = cs[i]!;
+    // Fetch Jup audit first (fees + organicScoreLabel). Uses the 5-min cache
+    // in jupGate.ts. On any failure keep defaults (0 / "") so sweeps still run.
+    try {
+      const audit = await fetchJupAudit(c.mint);
+      if (audit) {
+        c.fees = audit.fees;
+        c.organicScoreLabel = audit.organicScoreLabel;
+      }
+    } catch {
+      // swallow - keep defaults
+    }
     const candles = await fetchKlines(c.mint);
     computeForwardPnL(c, candles);
     if (c.hasOhlcv) withOhlcv++;
@@ -355,6 +416,8 @@ export async function runOkxFilterAnalysis(opts?: {
     computeSweep(spec.label, usable, spec.field, spec.thresholds, spec.dir),
   );
 
+  const sweepsCategorical: CategoricalSweepResult[] = [computeCategoricalSweep(usable)];
+
   onProgress?.("done", 100);
 
   return {
@@ -362,6 +425,7 @@ export async function runOkxFilterAnalysis(opts?: {
     withOhlcv,
     byTimeFrame,
     sweeps,
+    sweepsCategorical,
     csvPath,
   };
 }
@@ -377,6 +441,7 @@ async function writeCsv(cs: Candidate[]): Promise<string> {
     "holders", "uniqueTraders", "txs", "txsBuy", "txsSell", "buySellRatio",
     "priceChangePct", "top10Pct", "bundleHoldPct", "devHoldPct",
     "mentionsCount", "vibeScore", "riskLevel", "tokenAgeHours",
+    "fees", "organicScoreLabel",
     "hasOhlcv", "candleCount", "entryPrice", "maxPnLPct", "finalPnLPct", "minPnLPct", "timeToPeakMins",
   ];
   const rows = cs.map((c) => header.map((h) => {
@@ -406,10 +471,19 @@ async function main(): Promise<void> {
     return;
   }
 
-  console.log(`\nStep 2: fetching forward OHLCV for each...`);
+  console.log(`\nStep 2: fetching forward OHLCV + Jup audit for each...`);
   let withOhlcv = 0;
   for (let i = 0; i < cs.length; i++) {
     const c = cs[i]!;
+    try {
+      const audit = await fetchJupAudit(c.mint);
+      if (audit) {
+        c.fees = audit.fees;
+        c.organicScoreLabel = audit.organicScoreLabel;
+      }
+    } catch {
+      // ignore
+    }
     const candles = await fetchKlines(c.mint);
     computeForwardPnL(c, candles);
     if (c.hasOhlcv) withOhlcv++;

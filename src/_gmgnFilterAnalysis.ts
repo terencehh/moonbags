@@ -22,6 +22,7 @@ import {
   isGmgnConfigured,
   type GmgnRow,
 } from "./gmgnClient.js";
+import { fetchJupAudit } from "./jupGate.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -43,6 +44,9 @@ type Candidate = {
   kolCount: number;
   isHoneypot: boolean;
   isWashTrading: boolean;
+  // Jup-gate audit fields (fetched before klines; transient failures default to 0/"")
+  fees: number;
+  organicScoreLabel: string;
   // Forward PnL outcome
   hasOhlcv: boolean;
   candleCount: number;
@@ -143,6 +147,8 @@ async function harvestCandidates(): Promise<Candidate[]> {
         kolCount: 0,
         isHoneypot: false,
         isWashTrading: false,
+        fees: 0,
+        organicScoreLabel: "",
         hasOhlcv: false,
         candleCount: 0,
         entryPrice: 0,
@@ -251,11 +257,30 @@ export type GmgnSweepResult = {
 
 export type GmgnBySourceSummary = GmgnSweepSummary & { tfLabel: string };
 
+// Categorical sweep: each option describes a required label set. "any" keeps
+// everything, "medium|high" keeps tokens labeled medium or high, "high"
+// keeps only high-scored tokens. Adopt maps the winning option back to
+// jupGate.allowedScoreLabels.
+export type GmgnCategoricalSweepOption = GmgnSweepSummary & {
+  id: string;
+  label: string;
+  allowedLabels: string[];
+  kept: number;
+  dropped: number;
+};
+
+export type GmgnCategoricalSweepResult = {
+  field: string;
+  label: string;
+  options: GmgnCategoricalSweepOption[];
+};
+
 export type GmgnFilterAnalysisResult = {
   totalTokens: number;
   withOhlcv: number;
   byTimeFrame: GmgnBySourceSummary[];
   sweeps: GmgnSweepResult[];
+  sweepsCategorical: GmgnCategoricalSweepResult[];
   csvPath: string;
 };
 
@@ -323,7 +348,31 @@ const GMGN_SWEEP_SPECS: Array<{ label: string; field: keyof Candidate; threshold
   { label: "rugRatio (current default: 0.35)", field: "rugRatio", thresholds: [1, 0.5, 0.35, 0.2, 0.1, 0.05], dir: "max" },
   { label: "bundlerPct (current default: 50)", field: "bundlerPct", thresholds: [100, 80, 60, 50, 40, 30, 20, 10], dir: "max" },
   { label: "creatorBalancePct (current default: 20)", field: "creatorBalancePct", thresholds: [100, 50, 30, 20, 15, 10, 5], dir: "max" },
+  { label: "fees (jupGate.minFees)", field: "fees", thresholds: [0, 0.1, 0.5, 1, 2, 5, 10, 25, 50], dir: "min" },
 ];
+
+// Categorical sweep over Jup organicScoreLabel. Represented as a set of
+// allowed-label options so adopt can pick the highest-winrate set.
+const GMGN_JUP_LABEL_OPTIONS: Array<{ id: string; label: string; allowedLabels: string[] }> = [
+  { id: "any", label: "any label (no filter)", allowedLabels: [] },
+  { id: "medium_high", label: "medium or high", allowedLabels: ["medium", "high"] },
+  { id: "high", label: "high only", allowedLabels: ["high"] },
+];
+
+function computeCategoricalSweep(cs: Candidate[]): GmgnCategoricalSweepResult {
+  const options: GmgnCategoricalSweepOption[] = GMGN_JUP_LABEL_OPTIONS.map((opt) => {
+    const allowLower = opt.allowedLabels.map((l) => l.toLowerCase());
+    const kept = cs.filter((c) => {
+      if (allowLower.length === 0) return true;
+      const normalized = c.organicScoreLabel.toLowerCase();
+      return normalized.length > 0 && allowLower.includes(normalized);
+    });
+    const dropped = cs.length - kept.length;
+    const s = summarizeGroup(kept);
+    return { id: opt.id, label: opt.label, allowedLabels: opt.allowedLabels, kept: kept.length, dropped, ...s };
+  });
+  return { field: "organicScoreLabel", label: "organicScoreLabel (jupGate.allowedScoreLabels)", options };
+}
 
 export async function runGmgnFilterAnalysis(opts?: {
   onProgress?: (stage: string, pct: number) => void;
@@ -343,6 +392,7 @@ export async function runGmgnFilterAnalysis(opts?: {
       withOhlcv: 0,
       byTimeFrame: [],
       sweeps: [],
+      sweepsCategorical: [],
       csvPath: "",
     };
   }
@@ -361,6 +411,17 @@ export async function runGmgnFilterAnalysis(opts?: {
   for (let i = 0; i < candidates.length; i++) {
     const c = candidates[i];
     if (!c) continue;
+    // Fetch Jup audit first. Uses the 5-min cache in jupGate.ts. Transient
+    // failures default to 0 / "" so sweeps still run.
+    try {
+      const audit = await fetchJupAudit(c.mint);
+      if (audit) {
+        c.fees = audit.fees;
+        c.organicScoreLabel = audit.organicScoreLabel;
+      }
+    } catch {
+      // swallow - keep defaults
+    }
     const candles = await fetchKlines(c.mint);
     computeForwardPnL(c, candles);
     if (c.hasOhlcv) withOhlcv++;
@@ -384,6 +445,8 @@ export async function runGmgnFilterAnalysis(opts?: {
     computeSweep(spec.label, usable, spec.field, spec.thresholds, spec.dir),
   );
 
+  const sweepsCategorical: GmgnCategoricalSweepResult[] = [computeCategoricalSweep(usable)];
+
   onProgress?.("done", 100);
 
   return {
@@ -391,6 +454,7 @@ export async function runGmgnFilterAnalysis(opts?: {
     withOhlcv,
     byTimeFrame,
     sweeps,
+    sweepsCategorical,
     csvPath,
   };
 }
@@ -405,6 +469,7 @@ async function writeCsv(candidates: Candidate[]): Promise<string> {
     "liquidityUsd", "holders", "marketCapUsd",
     "top10Pct", "rugRatio", "bundlerPct", "creatorBalancePct",
     "smartMoneyCount", "kolCount", "isHoneypot", "isWashTrading",
+    "fees", "organicScoreLabel",
     "hasOhlcv", "candleCount",
     "entryPrice", "maxPnLPct", "finalPnLPct", "minPnLPct", "timeToPeakMins",
   ];
@@ -437,11 +502,20 @@ async function main(): Promise<void> {
   }
   console.log(`  → ${enriched}/${candidates.length} enriched              `);
 
-  console.log(`\nStep 3: fetching forward OHLCV (5m × 299 candles ≈ 25h) for each...`);
+  console.log(`\nStep 3: fetching Jup audit + forward OHLCV (5m × 299 candles ≈ 25h) for each...`);
   let withOhlcv = 0;
   for (let i = 0; i < candidates.length; i++) {
     const c = candidates[i];
     if (!c) continue;
+    try {
+      const audit = await fetchJupAudit(c.mint);
+      if (audit) {
+        c.fees = audit.fees;
+        c.organicScoreLabel = audit.organicScoreLabel;
+      }
+    } catch {
+      // ignore
+    }
     const candles = await fetchKlines(c.mint);
     computeForwardPnL(c, candles);
     if (c.hasOhlcv) withOhlcv++;
