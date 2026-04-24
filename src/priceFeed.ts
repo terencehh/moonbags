@@ -21,11 +21,16 @@ export async function getOkxPrices(
   const tokens = unique.join(",");
 
   try {
+    const localBin = `${process.env.HOME ?? "/root"}/.local/bin`;
+    const priceFeedEnv = {
+      ...process.env,
+      PATH: process.env.PATH?.includes(localBin) ? process.env.PATH : `${localBin}:${process.env.PATH ?? ""}`,
+    };
     const { stdout } = await execFileAsync("onchainos", [
       "market", "prices",
       "--tokens", tokens,
       "--chain", "solana",
-    ], { timeout: 3_000 });
+    ], { timeout: 3_000, env: priceFeedEnv });
 
     const json = JSON.parse(stdout) as {
       ok: boolean;

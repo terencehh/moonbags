@@ -303,6 +303,10 @@ function onchainosEnv(): NodeJS.ProcessEnv {
   if (!env.OKX_PASSPHRASE && env.OKX_API_PASSPHRASE) {
     env.OKX_PASSPHRASE = env.OKX_API_PASSPHRASE;
   }
+  const localBin = `${env.HOME ?? "/root"}/.local/bin`;
+  if (!env.PATH?.includes(localBin)) {
+    env.PATH = `${localBin}:${env.PATH ?? ""}`;
+  }
   return env;
 }
 
