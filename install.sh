@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_URL="${MOONBAGS_REPO_URL:-https://github.com/fciaf420/moonbags.git}"
+REPO_URL="${MOONBAGS_REPO_URL:-https://github.com/terencehh/moonbags.git}"
 APP_DIR="${MOONBAGS_DIR:-$HOME/moonbags}"
 PM2_NAME="${MOONBAGS_PM2_NAME:-moonbags}"
 
