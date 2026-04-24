@@ -1,6 +1,6 @@
 [build]
 builder = "NIXPACKS"
-buildCommand = "npm ci && npm run install:onchainos"
+buildCommand = "npm run install:onchainos"
 
 [deploy]
 startCommand = "npm run start"
