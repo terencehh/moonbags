@@ -1,3 +1,7 @@
+// Force IPv4 DNS — GMGN OpenAPI and some other endpoints reject IPv6 connections.
+import { setDefaultResultOrder } from "node:dns";
+setDefaultResultOrder("ipv4first");
+
 // [SCG-DISABLED 2026-04-22] SCG polling retired — keeping OKX + GMGN only.
 // Preserving import so scgPoller state (dedupe set, blacklist, etc.) still loads
 // for historical telegram views; `startScgPoller` stays imported but unused below.
