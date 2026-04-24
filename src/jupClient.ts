@@ -38,8 +38,8 @@ const TOKEN_PROGRAM_ID_PK = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss62
 // Jupiter docs warn: `referralAccount` disables RFQ routing. For pump.fun
 // meme tokens this is a non-factor (RFQ isn't a thing on those AMMs).
 // ---------------------------------------------------------------------------
-const REFERRAL_ACCOUNT = "7mqRQMFQqhE1sSN8jZYkiBaXNqWxQFgJwkYaxtaNV81Q";
-const REFERRAL_FEE_BPS = 50;          // 50 bps = 0.5% — Jupiter Ultra MINIMUM is 50 bps; 25 is rejected at /order
+const REFERRAL_ACCOUNT = "";           // empty = no referral fee
+const REFERRAL_FEE_BPS = 0;
 
 export interface GetOrderParams {
   inputMint: string;
