@@ -497,8 +497,12 @@ async function sendRiskControlsMenu(chatId: number): Promise<void> {
   });
 }
 
+// LLM mode toggles have their own /llm panel — exclude from the generic settings screen
+// to avoid confusion when both panels have toggle buttons for the same flags.
+const LLM_MODE_KEYS = new Set<SettableKey>(["LLM_EXIT_ENABLED", "LLM_ENTRY_ENABLED", "LLM_EXIT_IMMEDIATE"]);
+
 async function sendAllSettingsMenu(chatId: number): Promise<void> {
-  const keys = Object.keys(SETTABLE_SPECS) as SettableKey[];
+  const keys = (Object.keys(SETTABLE_SPECS) as SettableKey[]).filter((k) => !LLM_MODE_KEYS.has(k));
   const lines = keys.map((k) => {
     const spec = SETTABLE_SPECS[k];
     const v = (CONFIG as unknown as Record<string, unknown>)[k] as number | boolean | number[];
