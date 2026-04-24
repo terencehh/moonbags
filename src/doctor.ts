@@ -334,12 +334,15 @@ export async function runDoctor(options: { network?: boolean } = {}): Promise<Do
         : "macOS and Linux are the tested install targets.",
   });
 
+  // Accept Railway/container deployments where env vars are injected directly.
+  const envFileExists = existsSync(".env");
+  const envVarsPresent = hasValue(env, "JUP_API_KEY") && hasValue(env, "HELIUS_API_KEY") && hasValue(env, "TELEGRAM_BOT_TOKEN");
   checks.push({
     id: "env:file",
     label: ".env file",
-    status: existsSync(".env") ? "ok" : "fail",
-    detail: existsSync(".env") ? "found" : "missing",
-    fix: existsSync(".env") ? undefined : "Run npm run setup.",
+    status: envFileExists || envVarsPresent ? "ok" : "fail",
+    detail: envFileExists ? "found" : envVarsPresent ? "not found (Railway/container env vars detected)" : "missing",
+    fix: envFileExists || envVarsPresent ? undefined : "Run npm run setup.",
   });
 
   const node = process.versions.node;
@@ -356,9 +359,9 @@ export async function runDoctor(options: { network?: boolean } = {}): Promise<Do
   checks.push({
     id: "git",
     label: "Git",
-    status: git.ok ? "ok" : "fail",
+    status: git.ok ? "ok" : "warn",
     detail: git.ok ? firstLine(git.stdout) : git.error ?? "not found",
-    fix: git.ok ? undefined : "Install git, then rerun npm run doctor.",
+    fix: git.ok ? undefined : "Install git (not required for trading; needed for npm run update).",
   });
 
   const npm = await run("npm", ["--version"]);
