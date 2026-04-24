@@ -4,6 +4,7 @@ import logger from "./logger.js";
 import type { ScgAlert } from "./types.js";
 import { checkSignalMintCooldown, markSignalMintAccepted } from "./sourceDedupe.js";
 import { getRuntimeSettings } from "./settingsStore.js";
+import { fetchJupAudit, passesJupGate, type JupGateConfig } from "./jupGate.js";
 import { isBlacklisted, isPaused, recordAlertEvent } from "./scgPoller.js";
 import {
   getMarketSignal,
@@ -1385,6 +1386,24 @@ async function deepDiveCandidate(seed: GmgnSignalCandidate): Promise<DeepDiveRes
   next.alert = buildAlert(next);
   next.alert.score = next.score;
   next.alert.sourceMeta = next.sourceMeta;
+
+  // Jup audit gate — enforce fees + organicScoreLabel when Jupiter has data.
+  // When audit is null (token not indexed — too new/small), pass through and
+  // rely on GMGN-native signals. This lets new micro-caps through while still
+  // catching indexed tokens with zero organic score (e.g. bot-coordinated pumps).
+  const jupCfg = getRuntimeSettings().jupGate;
+  const audit = await fetchJupAudit(seed.mint);
+  const effectiveCfg: JupGateConfig = audit == null
+    ? { ...jupCfg, minFees: 0, allowedScoreLabels: [] }
+    : jupCfg;
+  const gate = passesJupGate(audit, effectiveCfg);
+  if (!gate.ok) {
+    return { ok: false, reason: gate.reason };
+  }
+  if (audit) {
+    next.sourceMeta = { ...next.sourceMeta, jupAudit: audit };
+    next.alert.sourceMeta = next.sourceMeta;
+  }
 
   return { ok: true, candidate: next };
 }
