@@ -1,0 +1,9 @@
+[build]
+builder = "NIXPACKS"
+nixpacksConfigPath = "nixpacks.toml"
+buildCommand = "npm ci && npm run install:onchainos"
+
+[deploy]
+startCommand = "npm run start"
+healthcheckPath = "/health"
+healthcheckTimeout = 30

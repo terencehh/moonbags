@@ -1,11 +1,2 @@
 [phases.setup]
 nixPkgs = ["git", "curl", "bash"]
-
-[phases.install]
-cmds = ["npm ci"]
-
-[phases.build]
-cmds = ["npm run install:onchainos"]
-
-[start]
-cmd = "npm run start"

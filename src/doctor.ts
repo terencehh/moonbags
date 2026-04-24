@@ -413,24 +413,34 @@ export async function runDoctor(options: { network?: boolean } = {}): Promise<Do
     });
   }
 
-  const pm2 = await run("pm2", ["--version"]);
-  checks.push({
-    id: "pm2",
-    label: "PM2",
-    status: pm2.ok ? "ok" : "warn",
-    detail: pm2.ok ? `v${firstLine(pm2.stdout)}` : "not installed or not on PATH",
-    fix: pm2.ok ? undefined : "Install with npm install -g pm2.",
-  });
-
-  if (pm2.ok) {
-    const pm2Process = await run("pm2", ["describe", PM2_PROCESS]);
+  const isManaged = Boolean(process.env.RAILWAY_ENVIRONMENT ?? process.env.RAILWAY_PROJECT_ID ?? process.env.FLY_APP_NAME);
+  if (isManaged) {
     checks.push({
-      id: "pm2:moonbags",
-      label: "PM2 moonbags process",
-      status: pm2Process.ok ? "ok" : "warn",
-      detail: pm2Process.ok ? "found" : "not found",
-      fix: pm2Process.ok ? undefined : `Start it with pm2 start "npm run start" --name ${PM2_PROCESS} && pm2 save.`,
+      id: "pm2",
+      label: "PM2",
+      status: "ok",
+      detail: "not needed (managed container environment detected)",
     });
+  } else {
+    const pm2 = await run("pm2", ["--version"]);
+    checks.push({
+      id: "pm2",
+      label: "PM2",
+      status: pm2.ok ? "ok" : "warn",
+      detail: pm2.ok ? `v${firstLine(pm2.stdout)}` : "not installed or not on PATH",
+      fix: pm2.ok ? undefined : "Install with npm install -g pm2.",
+    });
+
+    if (pm2.ok) {
+      const pm2Process = await run("pm2", ["describe", PM2_PROCESS]);
+      checks.push({
+        id: "pm2:moonbags",
+        label: "PM2 moonbags process",
+        status: pm2Process.ok ? "ok" : "warn",
+        detail: pm2Process.ok ? "found" : "not found",
+        fix: pm2Process.ok ? undefined : `Start it with pm2 start "npm run start" --name ${PM2_PROCESS} && pm2 save.`,
+      });
+    }
   }
 
   checks.push(...checkEnvVars(env));

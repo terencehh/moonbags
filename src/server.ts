@@ -264,6 +264,11 @@ export function startServer(): () => void {
 
     const pathname = url.split("?")[0] ?? "/";
 
+    if (pathname === "/health") {
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+
     if (pathname === "/api/state") {
       buildState()
         .then((state) => sendJson(res, 200, state))
