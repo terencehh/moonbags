@@ -1,8 +1,10 @@
 [build]
 builder = "NIXPACKS"
-buildCommand = "npm run install:onchainos"
+buildCommand = "npm run install:onchainos && npm install -g pm2"
 
 [deploy]
-startCommand = "npm run start"
+startCommand = "pm2-runtime start ecosystem.config.js"
 healthcheckPath = "/health"
 healthcheckTimeout = 30
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
