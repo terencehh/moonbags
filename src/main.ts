@@ -3,17 +3,6 @@
 import dns from "dns";
 dns.setDefaultResultOrder("ipv4first");
 
-// Optional outbound proxy — set HTTPS_PROXY (or HTTP_PROXY) in .env to route
-// all fetch() calls through a proxy (e.g. a residential proxy to unblock GMGN).
-import { ProxyAgent, setGlobalDispatcher } from "undici";
-const _proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
-if (_proxyUrl) {
-  setGlobalDispatcher(new ProxyAgent(_proxyUrl));
-  // Log with credentials masked so the key never appears in output.
-  const _masked = _proxyUrl.replace(/:\/\/([^@]+)@/, "://***@");
-  console.log(`[proxy] outbound fetch routed through ${_masked}`);
-}
-
 // [SCG-DISABLED 2026-04-22] SCG polling retired — keeping OKX + GMGN only.
 // Preserving import so scgPoller state (dedupe set, blacklist, etc.) still loads
 // for historical telegram views; `startScgPoller` stays imported but unused below.
