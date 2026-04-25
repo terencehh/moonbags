@@ -1179,8 +1179,9 @@ async function fetchSeeds(settings: GmgnSettings): Promise<GmgnSignalCandidate[]
           if (seed) seeds.push(seed);
         }
       } catch (err) {
+        const cause = (err as NodeJS.ErrnoException).cause;
         lastError = (err as Error).message;
-        logger.warn({ err: lastError, chain }, "[gmgn-source] trending fetch failed");
+        logger.warn({ err: lastError, cause: cause ? String(cause) : undefined, chain }, `[gmgn-source] trending fetch failed: ${lastError}`);
       }
     }
 
@@ -1199,8 +1200,9 @@ async function fetchSeeds(settings: GmgnSettings): Promise<GmgnSignalCandidate[]
           if (seed) seeds.push(seed);
         }
       } catch (err) {
+        const cause = (err as NodeJS.ErrnoException).cause;
         lastError = (err as Error).message;
-        logger.warn({ err: lastError, chain }, "[gmgn-source] trenches fetch failed");
+        logger.warn({ err: lastError, cause: cause ? String(cause) : undefined, chain }, `[gmgn-source] trenches fetch failed: ${lastError}`);
       }
     }
 
@@ -1216,8 +1218,9 @@ async function fetchSeeds(settings: GmgnSettings): Promise<GmgnSignalCandidate[]
           if (seed) seeds.push(seed);
         }
       } catch (err) {
+        const cause = (err as NodeJS.ErrnoException).cause;
         lastError = (err as Error).message;
-        logger.warn({ err: lastError, chain }, "[gmgn-source] signal fetch failed");
+        logger.warn({ err: lastError, cause: cause ? String(cause) : undefined, chain }, `[gmgn-source] signal fetch failed: ${lastError}`);
       }
     }
   }
