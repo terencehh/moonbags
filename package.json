@@ -20,7 +20,7 @@
     "dotenv": "16.4.5",
     "pino": "9.5.0",
     "pino-pretty": "11.3.0",
-    "pm2": "5.4.3",
+    "pm2": "6.0.14",
     "tsx": "4.19.0"
   },
   "devDependencies": {
