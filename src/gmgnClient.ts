@@ -271,11 +271,7 @@ async function requestJson(pathname: string, init: GmgnRequestInit = {}, ttlMs?:
       }
       throw err;
     } catch (err) {
-      const cause = err instanceof Error ? (err as NodeJS.ErrnoException).cause : undefined;
-      const causeMsg = cause ? ` (cause: ${String(cause)})` : "";
-      lastError = err instanceof Error
-        ? (causeMsg ? Object.assign(new Error(err.message + causeMsg), { cause }) : err)
-        : new Error(String(err));
+      lastError = err instanceof Error ? err : new Error(String(err));
       if (attempt + 1 < retryLimit && /AbortError|network|fetch/i.test(lastError.message)) {
         await new Promise((resolve) => setTimeout(resolve, 500));
         continue;
