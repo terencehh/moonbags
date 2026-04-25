@@ -8,49 +8,26 @@
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { backOff } from "exponential-backoff";
 import logger from "./logger.js";
 
 const execFileAsync = promisify(execFile);
 
 const CHAIN = "solana";
-const CLI_TIMEOUT_MS = 12_000;
+const CLI_TIMEOUT_MS = 15_000;
 const CLI_MAX_CONCURRENCY = 3;
 
 let activeCliCalls = 0;
 const cliQueue: Array<() => void> = [];
 
-// Exponential backoff state — shared across all CLI calls so a burst of rate-limit
-// errors doesn't just immediately cascade into the next burst.
-const BACKOFF_BASE_MS = 2_000;
-const BACKOFF_MAX_MS = 30_000;
-let backoffLevel = 0;
-let backoffUntil = 0;
-let lastFailedAt = 0;
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function onCliSuccess(): void {
-  if (backoffLevel > 0) backoffLevel--;
-}
-
-function onCliFailure(): void {
-  const now = Date.now();
-  // Only escalate the backoff level once per burst (failures within 1s count as one).
-  if (now - lastFailedAt > 1_000) {
-    backoffLevel = Math.min(backoffLevel + 1, 4); // max 2^4 * 2s = 32s → capped at 30s
-  }
-  lastFailedAt = now;
-  const delay = Math.min(BACKOFF_BASE_MS * (1 << backoffLevel), BACKOFF_MAX_MS);
-  const candidate = now + delay;
-  if (candidate > backoffUntil) backoffUntil = candidate;
-}
+// Shared rate-limit gate — when any call detects a rate-limit error, this
+// timestamp is pushed forward so all other pending withCliSlot callers also
+// wait out the cooldown before acquiring a slot.
+let rateLimitUntil = 0;
 
 async function withCliSlot<T>(fn: () => Promise<T>): Promise<T> {
-  // Wait out any active rate-limit backoff before competing for a slot.
-  const pause = backoffUntil - Date.now();
-  if (pause > 0) await sleep(pause);
+  const pause = rateLimitUntil - Date.now();
+  if (pause > 0) await new Promise<void>((resolve) => setTimeout(resolve, pause));
 
   if (activeCliCalls >= CLI_MAX_CONCURRENCY) {
     await new Promise<void>((resolve) => cliQueue.push(resolve));
@@ -61,6 +38,16 @@ async function withCliSlot<T>(fn: () => Promise<T>): Promise<T> {
   } finally {
     activeCliCalls--;
     cliQueue.shift()?.();
+  }
+}
+
+function isRateLimitError(err: unknown): boolean {
+  const stdout = String((err as Record<string, unknown>).stdout ?? "");
+  try {
+    const parsed = JSON.parse(stdout) as { error?: string };
+    return typeof parsed.error === "string" && /rate.limit/i.test(parsed.error);
+  } catch {
+    return /rate.limit/i.test(stdout);
   }
 }
 
@@ -85,32 +72,47 @@ function cacheSet<T>(key: string, value: T): void {
 }
 
 // ---------------------------------------------------------------------------
-// Low-level CLI runner
+// Low-level CLI runner — exported so okxDiscoverySource can share the same
+// concurrency slot queue and rate-limit gate rather than running unthrottled.
 // ---------------------------------------------------------------------------
-async function runCli<T>(args: string[]): Promise<T | null> {
+export async function runOkxCli<T>(args: string[], tag = "[okx]"): Promise<T | null> {
   try {
-    const { stdout } = await withCliSlot(() =>
-      execFileAsync("onchainos", args, {
-        timeout: CLI_TIMEOUT_MS,
-        env: onchainosEnv(),
-      }),
+    const { stdout } = await backOff(
+      () => withCliSlot(() =>
+        execFileAsync("onchainos", args, { timeout: CLI_TIMEOUT_MS, env: onchainosEnv() }),
+      ),
+      {
+        numOfAttempts: 5,
+        startingDelay: 2_000,
+        maxDelay: 30_000,
+        timeMultiple: 2,
+        jitter: "full",
+        retry: (err, attemptNumber) => {
+          if (!isRateLimitError(err)) return false;
+          // Push the shared gate so other queued calls also back off.
+          const delay = Math.min(2_000 * Math.pow(2, attemptNumber - 1), 30_000);
+          const until = Date.now() + delay;
+          if (until > rateLimitUntil) rateLimitUntil = until;
+          logger.warn({ args: args.join(" "), attemptNumber, delayMs: delay }, `${tag} rate-limited — retrying`);
+          return true;
+        },
+      },
     );
+
     const json = JSON.parse(stdout) as { ok: boolean; data?: T };
     if (!json.ok) {
-      logger.warn({ args: args.join(" ") }, "[okx] response not-ok");
+      logger.warn({ args: args.join(" ") }, `${tag} response not-ok`);
       return null;
     }
-    onCliSuccess();
     return json.data ?? null;
   } catch (err) {
-    onCliFailure();
-    const nextBackoffMs = backoffUntil - Date.now();
-    logger.warn(
-      { ...describeCliError(err), args: args.join(" "), backoffMs: nextBackoffMs },
-      "[okx] cli failed",
-    );
+    logger.warn({ ...describeCliError(err), args: args.join(" ") }, `${tag} cli failed`);
     return null;
   }
+}
+
+function runCli<T>(args: string[]): Promise<T | null> {
+  return runOkxCli<T>(args);
 }
 
 function onchainosEnv(): NodeJS.ProcessEnv {

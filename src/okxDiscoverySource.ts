@@ -18,8 +18,6 @@
  */
 
 import path from "node:path";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import logger from "./logger.js";
 import type { ScgAlert } from "./types.js";
@@ -27,6 +25,7 @@ import { checkSignalMintCooldown, markSignalMintAccepted } from "./sourceDedupe.
 import { getRuntimeSettings } from "./settingsStore.js";
 import { fetchJupAudit, passesJupGate } from "./jupGate.js";
 import { isBlacklisted, isPaused, recordAlertEvent } from "./scgPoller.js";
+import { runOkxCli } from "./okxClient.js";
 import {
   getMaybeBool,
   getMaybeNumber,
@@ -172,9 +171,6 @@ const POLL_MS = 30_000;
 const SEEN_CAP = 10_000;
 const SNAPSHOT_CAP = 5_000;
 const RECENT_REJECTION_CAP = 20;
-const CLI_TIMEOUT_MS = 15_000;
-
-const execFileAsync = promisify(execFile);
 
 const DEFAULT_SETTINGS: OkxDiscoverySettings = {
   enabled: true,
@@ -296,50 +292,16 @@ function currentSettings(): OkxDiscoverySettings {
 }
 
 // ---------------------------------------------------------------------------
-// CLI runner (mirrors okxClient.ts)
+// CLI runner — delegates to okxClient.runOkxCli so all onchainos calls
+// share the same concurrency slot queue and exponential backoff state.
 // ---------------------------------------------------------------------------
-function onchainosEnv(): NodeJS.ProcessEnv {
-  const env = { ...process.env };
-  if (!env.OKX_PASSPHRASE && env.OKX_API_PASSPHRASE) {
-    env.OKX_PASSPHRASE = env.OKX_API_PASSPHRASE;
-  }
-  const localBin = `${env.HOME ?? "/root"}/.local/bin`;
-  if (!env.PATH?.includes(localBin)) {
-    env.PATH = `${localBin}:${env.PATH ?? ""}`;
-  }
-  return env;
-}
-
-async function runCli<T>(args: string[]): Promise<T | null> {
-  try {
-    const { stdout } = await execFileAsync("onchainos", args, {
-      timeout: CLI_TIMEOUT_MS,
-      env: onchainosEnv(),
-    });
-    const json = JSON.parse(stdout) as { ok: boolean; data?: T };
-    if (!json.ok) {
-      logger.warn({ args: args.join(" ") }, "[okx-discovery] response not-ok");
-      return null;
-    }
-    return json.data ?? null;
-  } catch (err) {
-    const e = err as Error & { stdout?: string | Buffer; stderr?: string | Buffer; code?: number | string };
-    logger.warn(
-      {
-        err: e.message,
-        code: e.code,
-        stdout: String(e.stdout ?? "").slice(0, 400),
-        stderr: String(e.stderr ?? "").slice(0, 400),
-        args: args.join(" "),
-      },
-      "[okx-discovery] cli failed",
-    );
-    return null;
-  }
+function runCli<T>(args: string[]): Promise<T | null> {
+  return runOkxCli<T>(args, "[okx-discovery]");
 }
 
 function isOkxConfigured(): boolean {
-  const env = onchainosEnv();
+  const env = { ...process.env };
+  if (!env.OKX_PASSPHRASE && env.OKX_API_PASSPHRASE) env.OKX_PASSPHRASE = env.OKX_API_PASSPHRASE;
   return Boolean(env.OKX_API_KEY && env.OKX_SECRET_KEY && env.OKX_PASSPHRASE);
 }
 
