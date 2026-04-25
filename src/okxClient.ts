@@ -19,7 +19,39 @@ const CLI_MAX_CONCURRENCY = 3;
 let activeCliCalls = 0;
 const cliQueue: Array<() => void> = [];
 
+// Exponential backoff state — shared across all CLI calls so a burst of rate-limit
+// errors doesn't just immediately cascade into the next burst.
+const BACKOFF_BASE_MS = 2_000;
+const BACKOFF_MAX_MS = 30_000;
+let backoffLevel = 0;
+let backoffUntil = 0;
+let lastFailedAt = 0;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function onCliSuccess(): void {
+  if (backoffLevel > 0) backoffLevel--;
+}
+
+function onCliFailure(): void {
+  const now = Date.now();
+  // Only escalate the backoff level once per burst (failures within 1s count as one).
+  if (now - lastFailedAt > 1_000) {
+    backoffLevel = Math.min(backoffLevel + 1, 4); // max 2^4 * 2s = 32s → capped at 30s
+  }
+  lastFailedAt = now;
+  const delay = Math.min(BACKOFF_BASE_MS * (1 << backoffLevel), BACKOFF_MAX_MS);
+  const candidate = now + delay;
+  if (candidate > backoffUntil) backoffUntil = candidate;
+}
+
 async function withCliSlot<T>(fn: () => Promise<T>): Promise<T> {
+  // Wait out any active rate-limit backoff before competing for a slot.
+  const pause = backoffUntil - Date.now();
+  if (pause > 0) await sleep(pause);
+
   if (activeCliCalls >= CLI_MAX_CONCURRENCY) {
     await new Promise<void>((resolve) => cliQueue.push(resolve));
   }
@@ -68,9 +100,15 @@ async function runCli<T>(args: string[]): Promise<T | null> {
       logger.warn({ args: args.join(" ") }, "[okx] response not-ok");
       return null;
     }
+    onCliSuccess();
     return json.data ?? null;
   } catch (err) {
-    logger.warn({ ...describeCliError(err), args: args.join(" ") }, "[okx] cli failed");
+    onCliFailure();
+    const nextBackoffMs = backoffUntil - Date.now();
+    logger.warn(
+      { ...describeCliError(err), args: args.join(" "), backoffMs: nextBackoffMs },
+      "[okx] cli failed",
+    );
     return null;
   }
 }
