@@ -7,7 +7,7 @@ dns.setDefaultResultOrder("ipv4first");
 // Preserving import so scgPoller state (dedupe set, blacklist, etc.) still loads
 // for historical telegram views; `startScgPoller` stays imported but unused below.
 import { startScgPoller, loadPollerState } from "./scgPoller.js";
-import { openPosition, tickPositions, tickLlmAdvisor, getPositions, loadPersistedPositions } from "./positionManager.js";
+import { openPosition, tickPositions, tickLlmAdvisor, tickLlmHeartbeat, getPositions, loadPersistedPositions } from "./positionManager.js";
 import { startServer } from "./server.js";
 import { startTelegramBot } from "./telegramBot.js";
 import { notifyBoot } from "./notifier.js";
@@ -129,6 +129,7 @@ async function main(): Promise<void> {
   }
   const llmInterval: NodeJS.Timeout = setInterval(() => {
     tickLlmAdvisor().catch((e) => logger.error({ err: String(e) }, "tickLlmAdvisor crashed"));
+    tickLlmHeartbeat().catch((e) => logger.error({ err: String(e) }, "tickLlmHeartbeat crashed"));
   }, CONFIG.LLM_POLL_MS);
 
   let shuttingDown = false;

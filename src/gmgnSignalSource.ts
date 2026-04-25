@@ -258,7 +258,7 @@ const DEFAULT_SETTINGS: GmgnSettings = {
     minLiquidityUsd: 10_000,
     minHolders: 150,
     minTokenAgeMins: 5,
-    maxTokenAgeMins: 240,
+    maxTokenAgeMins: 1440,
     minSmartMoneyCount: 0,
     minKolCount: 0,
     maxRugRatio: 0.35,

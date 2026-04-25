@@ -78,6 +78,8 @@ export interface Position {
   lastLlmCheckAt?: number;        // throttle: don't ask LLM more than once per LLM_POLL_MS
   llmActiveNotified?: boolean;    // dedupe: only send "LLM watching" once per position
   lastLlmReason?: string;         // surfaced in the SELL Telegram message when LLM triggers exit
+  llmWatchStartedAt?: number;     // timestamp when LLM first picked up this position
+  lastLlmHeartbeatAt?: number;    // timestamp of most recent heartbeat notification
   // Milestone notifications: which PnL-% thresholds have already fired (fire-once dedupe)
   milestonesHit?: number[];
   // TP ladder targets already executed for this position (stores target indexes).

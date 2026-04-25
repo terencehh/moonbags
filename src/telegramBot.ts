@@ -1,6 +1,6 @@
 import { CONFIG, SETTABLE_SPECS, setConfigValue as setConfigValueRaw, toggleConfigValue as toggleConfigValueRaw, type SetConfigResult, type SettableKey } from "./config.js";
 import logger from "./logger.js";
-import { getPositions, forceClosePosition, getStats, getClosedTrades, getSignalStats, type ClosedTrade } from "./positionManager.js";
+import { getPositions, forceClosePosition, dismissPosition, getStats, getClosedTrades, getSignalStats, type ClosedTrade } from "./positionManager.js";
 import { getWalletSolBalance, getWalletAddress, reclaimEmptyTokenAccounts, scanEmptyTokenAccounts, type ReclaimResult } from "./jupClient.js";
 import {
   isPaused,
@@ -1693,8 +1693,27 @@ async function handleStats(chatId: number): Promise<void> {
     })
     .join("\n");
 
+  // Exit reason breakdown
+  const auto = Object.entries(stats.byExitReason)
+    .filter(([r]) => r !== "manual" && r !== "error")
+    .reduce((s, [, n]) => s + n, 0);
+  const manual = stats.byExitReason["manual"] ?? 0;
+  const reasonParts = Object.entries(stats.byExitReason)
+    .sort(([, a], [, b]) => b - a)
+    .map(([r, n]) => `${r}: ${n}`)
+    .join("  ·  ");
+
+  const armedLine = stats.allTrades > 0
+    ? `  Armed before exit: ${stats.armedCount} / ${stats.allTrades} (${(stats.armedRate * 100).toFixed(0)}%)`
+    : "";
+
   const lines: string[] = [
-    `📊 <b>Signal Stats</b> — ${stats.totalTrades} trades with metadata`,
+    `📊 <b>Signal Stats</b> — ${stats.totalTrades} trades with metadata  (${stats.allTrades} total)`,
+    "",
+    `<b>Exit Breakdown</b>`,
+    `  Auto: ${auto}  |  Manual: ${manual}`,
+    `  ${escapeHtml(reasonParts)}`,
+    armedLine,
     "",
     `<b>MCap at Entry</b>`,
     `  Median: ${fmtMcap(stats.mcap.median)} | Mean: ${fmtMcap(stats.mcap.mean)}`,
@@ -1924,6 +1943,27 @@ async function handleMcapFilter(chatId: number, argText: string): Promise<void> 
 }
 
 // ---------------------------------------------------------------------------
+// /dismiss <mint> — remove a position from state without attempting a sell.
+// Use when tokens are already burned/gone and the position is stuck open.
+// ---------------------------------------------------------------------------
+async function handleDismiss(chatId: number, argText: string): Promise<void> {
+  const mint = argText.trim();
+  if (!mint) {
+    await tgPost("sendMessage", {
+      chat_id: chatId,
+      text: "Usage: <code>/dismiss &lt;mint&gt;</code>\n\nRemoves a position from state without selling. Use when tokens are already burned or otherwise gone.",
+      parse_mode: "HTML",
+    });
+    return;
+  }
+  const result = dismissPosition(mint);
+  await tgPost("sendMessage", {
+    chat_id: chatId,
+    text: result.ok ? `✅ Dismissed: ${escapeHtml(result.reason)}` : `❌ ${escapeHtml(result.reason)}`,
+    parse_mode: "HTML",
+  });
+}
+
 // /skip <mint> — blacklist a token so source alerts for it are ignored.
 // ---------------------------------------------------------------------------
 async function handleSkip(chatId: number, argText: string): Promise<void> {
@@ -2882,7 +2922,7 @@ async function handleFilterSweep(chatId: number, source: "gmgn" | "okx"): Promis
 
     if (source === "okx") {
       const result: OkxFilterAnalysisResult = await runOkxFilterAnalysis({
-        onProgress: (stage, pct) => { void editProgress(stage, pct); },
+        onProgress: (stage, pct) => editProgress(stage, pct),
       });
       totalTokens = result.totalTokens;
       withOhlcv = result.withOhlcv;
@@ -2894,7 +2934,7 @@ async function handleFilterSweep(chatId: number, source: "gmgn" | "okx"): Promis
       fieldMap = OKX_FIELD_TO_BASELINE_KEY;
     } else {
       const result: GmgnFilterAnalysisResult = await runGmgnFilterAnalysis({
-        onProgress: (stage, pct) => { void editProgress(stage, pct); },
+        onProgress: (stage, pct) => editProgress(stage, pct),
       });
       totalTokens = result.totalTokens;
       withOhlcv = result.withOhlcv;
@@ -3704,6 +3744,7 @@ export function startTelegramBot(): () => void {
               case "/ping":      await handlePing(chatId); break;
               case "/sellall":   await handleSellAll(chatId); break;
               case "/skip":      await handleSkip(chatId, argText); break;
+              case "/dismiss":   await handleDismiss(chatId, argText); break;
               case "/mint":      await handleMint(chatId, argText); break;
               case "/wallet":    await handleWallet(chatId); break;
               case "/reclaim":   await handleReclaim(chatId); break;

@@ -120,14 +120,25 @@ async function fetchKlines(address: string): Promise<Candle[]> {
 }
 
 async function harvestCandidates(): Promise<Candidate[]> {
-  const settled = await Promise.allSettled([
-    getMarketSignal("sol", { groups: [{ signal_type: [12] }], limit: 30 }),
-    getMarketTrenches("sol", { limit: 30 }),
-    getMarketTrending("sol", "5m", { limit: 30 }),
-  ]);
-  const signalRows = settled[0].status === "fulfilled" ? settled[0].value : [];
-  const trenchesRows = settled[1].status === "fulfilled" ? settled[1].value : [];
-  const trendingRows = settled[2].status === "fulfilled" ? settled[2].value : [];
+  let settled: PromiseSettledResult<GmgnRow[]>[] = [];
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    settled = await Promise.allSettled([
+      getMarketSignal("sol", { groups: [{ signal_type: [12] }], limit: 30 }),
+      getMarketTrenches("sol", { limit: 30 }),
+      getMarketTrending("sol", "5m", { limit: 30 }),
+    ]);
+    const anyFulfilled = settled.some(
+      (r): r is PromiseFulfilledResult<GmgnRow[]> => r.status === "fulfilled" && r.value.length > 0,
+    );
+    if (anyFulfilled) break;
+    if (attempt < 3) await new Promise((r) => setTimeout(r, 5_000));
+  }
+  const signalRows = (settled[0] as PromiseSettledResult<GmgnRow[]> | undefined)?.status === "fulfilled"
+    ? (settled[0] as PromiseFulfilledResult<GmgnRow[]>).value : [];
+  const trenchesRows = (settled[1] as PromiseSettledResult<GmgnRow[]> | undefined)?.status === "fulfilled"
+    ? (settled[1] as PromiseFulfilledResult<GmgnRow[]>).value : [];
+  const trendingRows = (settled[2] as PromiseSettledResult<GmgnRow[]> | undefined)?.status === "fulfilled"
+    ? (settled[2] as PromiseFulfilledResult<GmgnRow[]>).value : [];
 
   const seen = new Map<string, Candidate>();
   const harvest = (rows: GmgnRow[], source: "signal" | "trenches" | "trending") => {
@@ -348,10 +359,14 @@ function sweepThreshold(
 const GMGN_SWEEP_SPECS: Array<{ label: string; field: keyof Candidate; thresholds: number[]; dir: "min" | "max" }> = [
   { label: "liquidityUsd (current default: 10,000)", field: "liquidityUsd", thresholds: [0, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000], dir: "min" },
   { label: "holders (current default: 200)", field: "holders", thresholds: [0, 50, 100, 200, 500, 1_000, 2_000], dir: "min" },
+  { label: "marketCapUsd — lower bound", field: "marketCapUsd", thresholds: [0, 10_000, 25_000, 50_000, 100_000, 250_000], dir: "min" },
+  { label: "marketCapUsd — upper bound", field: "marketCapUsd", thresholds: [5_000_000, 1_000_000, 500_000, 250_000, 100_000], dir: "max" },
   { label: "top10Pct (current default: 45)", field: "top10Pct", thresholds: [100, 80, 60, 50, 45, 40, 35, 30, 25, 20], dir: "max" },
   { label: "rugRatio (current default: 0.35)", field: "rugRatio", thresholds: [1, 0.5, 0.35, 0.2, 0.1, 0.05], dir: "max" },
   { label: "bundlerPct (current default: 50)", field: "bundlerPct", thresholds: [100, 80, 60, 50, 40, 30, 20, 10], dir: "max" },
   { label: "creatorBalancePct (current default: 20)", field: "creatorBalancePct", thresholds: [100, 50, 30, 20, 15, 10, 5], dir: "max" },
+  { label: "smartMoneyCount (baseline minSmartMoneyCount)", field: "smartMoneyCount", thresholds: [0, 1, 2, 3, 5], dir: "min" },
+  { label: "kolCount (baseline minKolCount)", field: "kolCount", thresholds: [0, 1, 2, 3], dir: "min" },
   { label: "fees (jupGate.minFees)", field: "fees", thresholds: [0, 0.1, 0.5, 1, 2, 5, 10, 25, 50], dir: "min" },
   { label: "organicVolumePct (jupGate.minOrganicVolumePct)", field: "organicVolumePct", thresholds: [0, 1, 2, 5, 10, 15, 20, 30], dir: "min" },
   { label: "organicBuyersPct (jupGate.minOrganicBuyersPct)", field: "organicBuyersPct", thresholds: [0, 1, 2, 3, 5, 7, 10], dir: "min" },
@@ -381,16 +396,16 @@ function computeCategoricalSweep(cs: Candidate[]): GmgnCategoricalSweepResult {
 }
 
 export async function runGmgnFilterAnalysis(opts?: {
-  onProgress?: (stage: string, pct: number) => void;
+  onProgress?: (stage: string, pct: number) => void | Promise<void>;
 }): Promise<GmgnFilterAnalysisResult> {
   const onProgress = opts?.onProgress;
   if (!isGmgnConfigured()) {
     throw new Error("GMGN_API_KEY not set in env");
   }
 
-  onProgress?.("harvesting candidates", 0);
+  await onProgress?.("harvesting candidates", 0);
   const candidates = await harvestCandidates();
-  onProgress?.(`harvested ${candidates.length} candidates`, 10);
+  await onProgress?.(`harvested ${candidates.length} candidates`, 10);
 
   if (candidates.length === 0) {
     return {
@@ -409,7 +424,7 @@ export async function runGmgnFilterAnalysis(opts?: {
     enriched++;
     if (enriched % 5 === 0 || enriched === candidates.length) {
       const pct = 10 + Math.round((enriched / candidates.length) * 30);
-      onProgress?.(`enriched ${enriched}/${candidates.length}`, pct);
+      await onProgress?.(`enriched ${enriched}/${candidates.length}`, pct);
     }
   }
 
@@ -435,12 +450,12 @@ export async function runGmgnFilterAnalysis(opts?: {
     if (c.hasOhlcv) withOhlcv++;
     if (i % 5 === 0 || i === candidates.length - 1) {
       const pct = 40 + Math.round(((i + 1) / candidates.length) * 55);
-      onProgress?.(`OHLCV ${i + 1}/${candidates.length} (hasData=${withOhlcv})`, pct);
+      await onProgress?.(`OHLCV ${i + 1}/${candidates.length} (hasData=${withOhlcv})`, pct);
     }
   }
 
   const csvPath = await writeCsv(candidates);
-  onProgress?.("computing sweeps", 97);
+  await onProgress?.("computing sweeps", 97);
 
   const usable = candidates.filter((c) => c.hasOhlcv);
 
@@ -455,7 +470,7 @@ export async function runGmgnFilterAnalysis(opts?: {
 
   const sweepsCategorical: GmgnCategoricalSweepResult[] = [computeCategoricalSweep(usable)];
 
-  onProgress?.("done", 100);
+  await onProgress?.("done", 100);
 
   return {
     totalTokens: candidates.length,

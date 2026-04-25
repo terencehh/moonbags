@@ -112,6 +112,7 @@ export const CONFIG = ({
   LLM_ENTRY_ENABLED: bool("LLM_ENTRY_ENABLED", false),
   LLM_EXIT_IMMEDIATE: bool("LLM_EXIT_IMMEDIATE", false),
   LLM_POLL_MS: num("LLM_POLL_MS", 30_000),
+  LLM_HEARTBEAT_MINS: num("LLM_HEARTBEAT_MINS", 15),
   OKX_WSS_ENABLED: bool("OKX_WSS_ENABLED", false),
   // LLM provider — defaults to MiniMax for backwards compat.
   // Set LLM_API_KEY + LLM_ENDPOINT + LLM_MODEL to use any OpenAI-compatible

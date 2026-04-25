@@ -189,6 +189,26 @@ export function notifyLlmActive(args: {
   );
 }
 
+export function notifyLlmHeartbeat(args: {
+  name: string;
+  mint: string;
+  pnlPct: number;
+  trailFloorSol: number;     // current trail floor or stop level in SOL
+  lastDecision: string;      // last LLM reason string
+  watchingMins: number;      // how long LLM has been watching this position
+}): Promise<void> {
+  const sign = args.pnlPct >= 0 ? "+" : "";
+  const held = args.watchingMins >= 60
+    ? `${Math.floor(args.watchingMins / 60)}h ${args.watchingMins % 60}m`
+    : `${args.watchingMins}m`;
+  return send(
+    `🤖 <b>LLM heartbeat — ${escapeHtml(args.name)}</b>\n` +
+    `PnL: <b>${sign}${(args.pnlPct * 100).toFixed(1)}%</b>  |  floor: ${args.trailFloorSol.toFixed(4)} SOL\n` +
+    `watched: ${held}  |  last: <i>${escapeHtml(args.lastDecision)}</i>\n` +
+    `<a href="${gmgn(escapeHtml(args.mint))}">GMGN</a>`,
+  );
+}
+
 export function notifyLlmTighten(args: {
   name: string;
   mint: string;

@@ -5,7 +5,7 @@ import { CONFIG, SOL_MINT } from "./config.js";
 import logger from "./logger.js";
 import { buyTokenWithSol, sellTokenForSol, getWalletTokenBalance, unwrapResidualWsol } from "./jupClient.js";
 import { getBatchPricesParallel, getPriceViaSellQuote } from "./priceFeed.js";
-import { notifyBuy, notifyBuyFail, notifySell, notifySellFail, notifyArmed, notifyMoonbagStart, notifyLlmActive, notifyLlmTighten, notifyLlmPartial, notifyTakeProfitPartial, notifyMilestone } from "./notifier.js";
+import { notifyBuy, notifyBuyFail, notifySell, notifySellFail, notifyArmed, notifyMoonbagStart, notifyLlmActive, notifyLlmTighten, notifyLlmPartial, notifyTakeProfitPartial, notifyMilestone, notifyLlmHeartbeat } from "./notifier.js";
 import { consultLlm, type LlmContext } from "./llmExitAdvisor.js";
 import { getPositionSnapshot } from "./okxClient.js";
 import { getOkxWsOverlay, unwatchOkxWsMint, watchOkxWsMint } from "./okxWsService.js";
@@ -46,6 +46,7 @@ export type ClosedTrade = {
   pnlPct: number;
   peakPnlPct: number;
   reason: string;
+  wasArmed?: boolean;
   partialCount?: number;
   partialEntrySol?: number;
   partialExitSol?: number;
@@ -150,6 +151,10 @@ export interface SourceStat {
 
 export interface SignalStats {
   totalTrades: number;
+  allTrades: number;
+  armedCount: number;
+  armedRate: number;
+  byExitReason: Record<string, number>;
   mcap: { mean: number; median: number; mode: number | null; min: number; max: number; stdev: number };
   byMcapTier: McapTierStat[];
   bestMcapTier: McapTierStat | null;
@@ -169,6 +174,16 @@ const MCAP_TIERS = [
 export async function getSignalStats(): Promise<SignalStats> {
   const all = await getClosedTrades(500);
   const withMeta = all.filter((t) => t.signalMeta != null);
+
+  // Armed rate and exit reason breakdown — uses all closed trades (not just those with metadata).
+  const armedTracked = all.filter((t) => t.wasArmed !== undefined);
+  const armedCount = armedTracked.filter((t) => t.wasArmed).length;
+  const armedRate = armedTracked.length > 0 ? armedCount / armedTracked.length : 0;
+  const byExitReason: Record<string, number> = {};
+  for (const t of all) {
+    const r = t.reason ?? "unknown";
+    byExitReason[r] = (byExitReason[r] ?? 0) + 1;
+  }
 
   const mcaps = withMeta.map((t) => t.signalMeta!.alert_mcap);
   const pnls  = withMeta.map((t) => t.pnlPct);
@@ -228,6 +243,10 @@ export async function getSignalStats(): Promise<SignalStats> {
   const { alertFilter } = getRuntimeSettings();
   return {
     totalTrades: withMeta.length,
+    allTrades: all.length,
+    armedCount,
+    armedRate,
+    byExitReason,
     mcap: {
       mean:   _smean(mcaps),
       median: _smedian(mcaps),
@@ -413,6 +432,15 @@ export function getPositions(): Position[] {
 export function adoptPosition(p: Position): void {
   positions.set(p.mint, p);
   markDirty();
+}
+
+export function dismissPosition(mint: string): { ok: boolean; reason: string } {
+  const p = positions.get(mint);
+  if (!p) return { ok: false, reason: "not found" };
+  positions.delete(mint);
+  markDirty();
+  logger.info({ mint, name: p.name, status: p.status }, "[dismiss] position removed from state without sell");
+  return { ok: true, reason: `removed ${p.name ?? mint}` };
 }
 
 export async function forceClosePosition(mint: string): Promise<{ ok: boolean; reason: string }> {
@@ -1199,7 +1227,8 @@ async function closePosition(mint: string, reason: CloseReason): Promise<void> {
     partialExitSol: partials.count ? partials.exitSol : undefined,
     remainingEntrySol: partials.count ? entrySol : undefined,
     remainingExitSol: partials.count ? exitSol : undefined,
-    reason, llmReason: reason === "llm" ? position.lastLlmReason : undefined,
+    reason, wasArmed: position.armed,
+    llmReason: reason === "llm" ? position.lastLlmReason : undefined,
     exitSig: sellResult.signature,
     signalMeta: position.signalMeta,
   });
@@ -1284,6 +1313,35 @@ export async function tickLlmAdvisor(): Promise<void> {
   })));
 }
 
+export async function tickLlmHeartbeat(): Promise<void> {
+  if (!CONFIG.LLM_EXIT_ENABLED) return;
+  const heartbeatMs = CONFIG.LLM_HEARTBEAT_MINS * 60_000;
+  const now = Date.now();
+  const watched = Array.from(positions.values()).filter((p) =>
+    p.status === "open" && p.llmActiveNotified && p.llmWatchStartedAt,
+  );
+  for (const p of watched) {
+    if (p.lastLlmHeartbeatAt && now - p.lastLlmHeartbeatAt < heartbeatMs) continue;
+    p.lastLlmHeartbeatAt = now;
+    markDirty();
+    const entry = p.entryPricePerTokenSol;
+    const current = p.currentPricePerTokenSol;
+    const pnlPct = entry > 0 ? current / entry - 1 : 0;
+    const trailFloorSol = p.armed
+      ? p.peakPricePerTokenSol * (1 - (p.dynamicTrailPct ?? CONFIG.TRAIL_PCT)) * (Number(p.tokensHeld) / 10 ** p.tokenDecimals)
+      : p.entryPricePerTokenSol * (1 - CONFIG.STOP_PCT) * (Number(p.tokensHeld) / 10 ** p.tokenDecimals);
+    const watchingMins = Math.round((now - (p.llmWatchStartedAt ?? p.openedAt)) / 60_000);
+    void notifyLlmHeartbeat({
+      name: p.name,
+      mint: p.mint,
+      pnlPct,
+      trailFloorSol,
+      lastDecision: p.lastLlmReason ?? "hold",
+      watchingMins,
+    });
+  }
+}
+
 async function consultOnePosition(position: Position): Promise<void> {
   position.lastLlmCheckAt = Date.now();
 
@@ -1295,6 +1353,7 @@ async function consultOnePosition(position: Position): Promise<void> {
   // One-time "LLM watching" notification when LLM first picks up an armed position.
   if (!position.llmActiveNotified) {
     position.llmActiveNotified = true;
+    position.llmWatchStartedAt = Date.now();
     markDirty();
     void notifyLlmActive({
       name: position.name,

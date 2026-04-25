@@ -21,6 +21,7 @@ import { promisify } from "node:util";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fetchJupAudit } from "./jupGate.js";
+import { getTokenSecurity } from "./gmgnClient.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -73,6 +74,9 @@ type Candidate = {
   vibeScore: number;
   riskLevel: number;
   tokenAgeHours: number;
+  // GMGN security fields (fetched before klines; failures default to 0)
+  rugRatio: number;
+  botDegenPct: number;
   // Jup-gate audit fields (fetched before klines; transient failures default to 0/"")
   fees: number;
   organicScoreLabel: string;
@@ -158,6 +162,8 @@ async function harvestHotTokens(timeFrames: string[]): Promise<Candidate[]> {
         vibeScore: num(row.vibeScore),
         riskLevel: Math.round(num(row.riskLevelControl)),
         tokenAgeHours,
+        rugRatio: 0,
+        botDegenPct: 0,
         fees: 0,
         organicScoreLabel: "",
         organicVolumePct: null,
@@ -334,6 +340,9 @@ const OKX_SWEEP_SPECS: Array<{ label: string; field: keyof Candidate; thresholds
   { label: "volumeUsd (hot-tokens window)", field: "volumeUsd", thresholds: [0, 10_000, 50_000, 250_000, 1_000_000], dir: "min" },
   { label: "priceChangePct (already pumping?)", field: "priceChangePct", thresholds: [0, 5, 10, 25, 50], dir: "min" },
   { label: "tokenAgeHours (filter out fresh rugs)", field: "tokenAgeHours", thresholds: [0, 1, 6, 24, 72, 168], dir: "min" },
+  { label: "rugRatio (baseline maxRugRatio)", field: "rugRatio", thresholds: [1, 0.5, 0.35, 0.2, 0.1, 0.05], dir: "max" },
+  { label: "botDegenPct (baseline maxBotRate)", field: "botDegenPct", thresholds: [100, 50, 30, 20, 10, 5], dir: "max" },
+  { label: "riskLevel (OKX risk tier 0=lowest)", field: "riskLevel", thresholds: [5, 4, 3, 2, 1], dir: "max" },
   { label: "fees (jupGate.minFees)", field: "fees", thresholds: [0, 0.1, 0.5, 1, 2, 5, 10, 25, 50], dir: "min" },
   { label: "organicVolumePct (jupGate.minOrganicVolumePct)", field: "organicVolumePct", thresholds: [0, 1, 2, 5, 10, 15, 20, 30], dir: "min" },
   { label: "organicBuyersPct (jupGate.minOrganicBuyersPct)", field: "organicBuyersPct", thresholds: [0, 1, 2, 3, 5, 7, 10], dir: "min" },
@@ -364,14 +373,14 @@ function computeCategoricalSweep(cs: Candidate[]): CategoricalSweepResult {
 
 export async function runOkxFilterAnalysis(opts?: {
   timeFrames?: string[];
-  onProgress?: (stage: string, pct: number) => void;
+  onProgress?: (stage: string, pct: number) => void | Promise<void>;
 }): Promise<OkxFilterAnalysisResult> {
   const timeFrames = opts?.timeFrames && opts.timeFrames.length > 0 ? opts.timeFrames : ["1", "2", "3", "4"];
   const onProgress = opts?.onProgress;
 
-  onProgress?.("harvesting hot-tokens", 0);
+  await onProgress?.("harvesting hot-tokens", 0);
   const cs = await harvestHotTokens(timeFrames);
-  onProgress?.(`harvested ${cs.length} unique tokens`, 10);
+  await onProgress?.(`harvested ${cs.length} unique tokens`, 10);
 
   if (cs.length === 0) {
     return {
@@ -387,15 +396,25 @@ export async function runOkxFilterAnalysis(opts?: {
   let withOhlcv = 0;
   for (let i = 0; i < cs.length; i++) {
     const c = cs[i]!;
-    // Fetch Jup audit first (fees + organicScoreLabel). Uses the 5-min cache
-    // in jupGate.ts. On any failure keep defaults (0 / "") so sweeps still run.
+    // Fetch Jup audit (fees + organicScoreLabel) and GMGN security (rugRatio +
+    // botDegenPct) in parallel. Both use internal caches; failures keep defaults.
     try {
-      const audit = await fetchJupAudit(c.mint);
-      if (audit) {
-        c.fees = audit.fees;
-        c.organicScoreLabel = audit.organicScoreLabel;
-        c.organicVolumePct = audit.organicVolumePct;
-        c.organicBuyersPct = audit.organicBuyersPct;
+      const [audit, sec] = await Promise.allSettled([
+        fetchJupAudit(c.mint),
+        getTokenSecurity("sol", c.mint),
+      ]);
+      if (audit.status === "fulfilled" && audit.value) {
+        c.fees = audit.value.fees;
+        c.organicScoreLabel = audit.value.organicScoreLabel;
+        c.organicVolumePct = audit.value.organicVolumePct;
+        c.organicBuyersPct = audit.value.organicBuyersPct;
+      }
+      if (sec.status === "fulfilled" && sec.value) {
+        const s = sec.value as Record<string, unknown>;
+        const rr = Number(s["rug_ratio"] ?? 0);
+        const bd = Number(s["bot_degen_rate"] ?? s["rat_trader_amount_rate"] ?? 0);
+        c.rugRatio = Number.isFinite(rr) ? rr : 0;
+        c.botDegenPct = Number.isFinite(bd) ? (bd <= 1 ? bd * 100 : bd) : 0;
       }
     } catch {
       // swallow - keep defaults
@@ -405,12 +424,12 @@ export async function runOkxFilterAnalysis(opts?: {
     if (c.hasOhlcv) withOhlcv++;
     if (i % 5 === 0 || i === cs.length - 1) {
       const pct = 10 + Math.round(((i + 1) / cs.length) * 80);
-      onProgress?.(`OHLCV ${i + 1}/${cs.length} (hasData=${withOhlcv})`, pct);
+      await onProgress?.(`OHLCV ${i + 1}/${cs.length} (hasData=${withOhlcv})`, pct);
     }
   }
 
   const csvPath = await writeCsv(cs);
-  onProgress?.("computing sweeps", 95);
+  await onProgress?.("computing sweeps", 95);
 
   const usable = cs.filter((c) => c.hasOhlcv);
 
@@ -426,7 +445,7 @@ export async function runOkxFilterAnalysis(opts?: {
 
   const sweepsCategorical: CategoricalSweepResult[] = [computeCategoricalSweep(usable)];
 
-  onProgress?.("done", 100);
+  await onProgress?.("done", 100);
 
   return {
     totalTokens: cs.length,
@@ -449,6 +468,7 @@ async function writeCsv(cs: Candidate[]): Promise<string> {
     "holders", "uniqueTraders", "txs", "txsBuy", "txsSell", "buySellRatio",
     "priceChangePct", "top10Pct", "bundleHoldPct", "devHoldPct",
     "mentionsCount", "vibeScore", "riskLevel", "tokenAgeHours",
+    "rugRatio", "botDegenPct",
     "fees", "organicScoreLabel",
     "hasOhlcv", "candleCount", "entryPrice", "maxPnLPct", "finalPnLPct", "minPnLPct", "timeToPeakMins",
   ];
