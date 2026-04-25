@@ -1,6 +1,7 @@
-// Force IPv4 DNS — GMGN OpenAPI and some other endpoints reject IPv6 connections.
-import { setDefaultResultOrder } from "node:dns";
-setDefaultResultOrder("ipv4first");
+// Force IPv4 DNS resolution — GMGN OpenAPI blocks IPv6 connections.
+// Must run before any network calls so it has to be the first thing in main.ts.
+import dns from "dns";
+dns.setDefaultResultOrder("ipv4first");
 
 // [SCG-DISABLED 2026-04-22] SCG polling retired — keeping OKX + GMGN only.
 // Preserving import so scgPoller state (dedupe set, blacklist, etc.) still loads

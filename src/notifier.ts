@@ -67,6 +67,10 @@ function solscan(sig: string): string {
   return `https://solscan.io/tx/${sig}`;
 }
 
+function solscanToken(mint: string): string {
+  return `https://solscan.io/token/${mint}`;
+}
+
 export function notifyBoot(): Promise<void> {
   const mbLine = CONFIG.MOONBAG_PCT > 0
     ? `\nmoonbag: ${(CONFIG.MOONBAG_PCT * 100).toFixed(0)}%  mb-trail: ${(CONFIG.MB_TRAIL_PCT * 100).toFixed(0)}%  mb-timeout: ${(CONFIG.MB_TIMEOUT_SECS / 60).toFixed(0)}m`
@@ -148,10 +152,13 @@ export function notifyMoonbagStart(args: {
   );
 }
 
-export function notifyBuyFail(args: { name: string; mint: string; attempts: number }): Promise<void> {
+export function notifyBuyFail(args: { name: string; mint: string; attempts: number; reason?: string; source?: string }): Promise<void> {
+  const sourceLabel = args.source ? escapeHtml(args.source.toUpperCase()) : "GMGN";
+  const reasonLine = args.reason ? `\n⚠️ ${escapeHtml(args.reason)}` : "";
   return send(
     `❌ <b>BUY FAILED ${escapeHtml(args.name)}</b>\n` +
-    `<a href="${gmgn(escapeHtml(args.mint))}">GMGN</a>`,
+    `${sourceLabel}${reasonLine}\n` +
+    `<a href="${gmgn(escapeHtml(args.mint))}">GMGN</a>  ·  <a href="${solscanToken(escapeHtml(args.mint))}">Solscan</a>`,
   );
 }
 

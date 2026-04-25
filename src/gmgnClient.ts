@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import logger from "./logger.js";
+import { ipv4Fetch } from "./ipv4Fetch.js";
 
 export type GmgnChain = "sol" | "bsc" | "base" | "eth";
 export type GmgnTrendingInterval = "1m" | "5m" | "1h" | "6h" | "24h";
@@ -214,7 +215,7 @@ async function requestJson(pathname: string, init: GmgnRequestInit = {}, ttlMs?:
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
     try {
-      const res = await fetch(url, {
+      const res = await ipv4Fetch(url, {
         ...init,
         headers: buildHeaders(init.headers),
         signal: controller.signal,

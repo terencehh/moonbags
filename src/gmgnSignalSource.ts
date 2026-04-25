@@ -4,7 +4,7 @@ import logger from "./logger.js";
 import type { ScgAlert } from "./types.js";
 import { checkSignalMintCooldown, markSignalMintAccepted } from "./sourceDedupe.js";
 import { getRuntimeSettings } from "./settingsStore.js";
-import { fetchJupAudit, passesJupGate } from "./jupGate.js";
+import { fetchJupAudit, passesJupGate, type JupGateConfig } from "./jupGate.js";
 import { isBlacklisted, isPaused, recordAlertEvent } from "./scgPoller.js";
 import {
   getMarketSignal,
@@ -67,6 +67,8 @@ type GmgnSettings = {
     maxMarketCapUsd: number;
     minLiquidityUsd: number;
     minHolders: number;
+    minTokenAgeMins: number;
+    maxTokenAgeMins: number;
     minSmartMoneyCount: number;
     minKolCount: number;
     maxRugRatio: number;
@@ -254,7 +256,9 @@ const DEFAULT_SETTINGS: GmgnSettings = {
     minMarketCapUsd: 0,
     maxMarketCapUsd: 0,
     minLiquidityUsd: 10_000,
-    minHolders: 200,
+    minHolders: 150,
+    minTokenAgeMins: 5,
+    maxTokenAgeMins: 240,
     minSmartMoneyCount: 0,
     minKolCount: 0,
     maxRugRatio: 0.35,
@@ -262,18 +266,18 @@ const DEFAULT_SETTINGS: GmgnSettings = {
     requireNoHoneypot: true,
     requireRenounced: false,
     requirePool: false,
-    maxBundlerPct: 50,
-    maxBotPct: 50,
+    maxBundlerPct: 40,
+    maxBotPct: 45,
     maxCreatorBalancePct: 20,
     requireNotWashTrading: true,
   },
   trigger: {
-    minScans: 2,
-    minHolderGrowthPct: 5,
-    maxHolderGrowthPct: 0,
+    minScans: 10,
+    minHolderGrowthPct: 7,
+    maxHolderGrowthPct: 50,
     maxLiquidityDropPct: 30,
     minBuySellRatio: 1.15,
-    minSmartOrKolCount: 1,
+    minSmartOrKolCount: 0,
   },
   mintCooldownMins: 90,
   liveScoreMin: 60,
@@ -410,6 +414,8 @@ function currentSettings(): GmgnSettings {
       maxMarketCapUsd: Math.max(0, finite(baseline.maxMcapUsd ?? filters.maxMarketCapUsd, DEFAULT_SETTINGS.filters.maxMarketCapUsd)),
       minLiquidityUsd: Math.max(0, finite(baseline.minLiquidityUsd ?? filters.minLiquidityUsd, DEFAULT_SETTINGS.filters.minLiquidityUsd)),
       minHolders: Math.max(0, Math.round(finite(baseline.minHolders ?? filters.minHolders, DEFAULT_SETTINGS.filters.minHolders))),
+      minTokenAgeMins: Math.max(0, Math.round(finite(filters.minTokenAgeMins, DEFAULT_SETTINGS.filters.minTokenAgeMins))),
+      maxTokenAgeMins: Math.max(0, Math.round(finite(filters.maxTokenAgeMins, DEFAULT_SETTINGS.filters.maxTokenAgeMins))),
       minSmartMoneyCount: Math.max(0, Math.round(finite(filters.minSmartMoneyCount, DEFAULT_SETTINGS.filters.minSmartMoneyCount))),
       minKolCount: Math.max(0, Math.round(finite(filters.minKolCount, DEFAULT_SETTINGS.filters.minKolCount))),
       maxRugRatio: finite(baseline.maxRugRatio ?? filters.maxRugRatio, DEFAULT_SETTINGS.filters.maxRugRatio),
@@ -597,6 +603,15 @@ function maybeReject(candidate: Partial<GmgnSignalCandidate>, _reason: string): 
   }
   if ((candidate.holders ?? 0) < filters.minHolders) {
     return `holders ${Math.round(candidate.holders ?? 0).toLocaleString("en-US")} < ${Math.round(filters.minHolders).toLocaleString("en-US")}`;
+  }
+  if (candidate.timestamp && candidate.timestamp > 0) {
+    const ageMins = Math.max(0, Math.floor((Date.now() - candidate.timestamp) / 60_000));
+    if (filters.minTokenAgeMins > 0 && ageMins < filters.minTokenAgeMins) {
+      return `token age ${ageMins}min < ${filters.minTokenAgeMins}min`;
+    }
+    if (filters.maxTokenAgeMins > 0 && ageMins > filters.maxTokenAgeMins) {
+      return `token age ${ageMins}min > ${filters.maxTokenAgeMins}min (too old)`;
+    }
   }
   if ((candidate.smartMoneyCount ?? 0) < filters.minSmartMoneyCount) {
     return `smart money ${Math.round(candidate.smartMoneyCount ?? 0)} < ${filters.minSmartMoneyCount}`;
@@ -954,7 +969,7 @@ function baseSeedFromRow(source: GmgnSourceKind, chain: GmgnChain, row: GmgnRow)
   const logo = getStringField(row, ["logo", "image", "icon"]);
   const timestamp =
     normalizeTimestamp(
-      getStringField(row, ["trigger_at", "timestamp", "time", "ts", "creation_timestamp", "created_at", "createdAt"]) ??
+      getStringField(row, ["trigger_at", "timestamp", "time", "ts", "creation_timestamp", "created_at", "createdAt", "open_timestamp"]) ??
         Date.now(),
     );
 
@@ -1277,27 +1292,34 @@ type DeepDiveResult =
 // fields on the candidate (does not override richer seed data). Callers
 // should re-check baseline filters on the returned candidate.
 //
-// Also applies the GLOBAL Jupiter datapi audit gate (fees + organicScoreLabel)
-// before emit — Jup transient failures default to pass (see src/jupGate.ts).
+// Also applies the Jupiter datapi audit gate (fees + organicScoreLabel) before
+// emit. GMGN-specific: when Jup has no data for a token (not indexed — common
+// for new/small tokens), we pass through and rely on GMGN-native signals.
+// When Jup DOES have data, fees + scoreLabel are enforced as configured.
 //
-// Returns { ok:false, reason } if either request throws (safer to drop than
-// fire on partial data) or the Jup gate rejects.
+// Returns { ok:false, reason } if the Jup gate rejects on indexed tokens.
 async function deepDiveCandidate(seed: GmgnSignalCandidate): Promise<DeepDiveResult> {
   let info: Record<string, unknown> | null = null;
   let security: Record<string, unknown> | null = null;
-  try {
-    const [infoRes, securityRes] = await Promise.all([
-      getTokenInfo(seed.chain, seed.mint),
-      getTokenSecurity(seed.chain, seed.mint),
-    ]);
-    info = (infoRes ?? null) as Record<string, unknown> | null;
-    security = (securityRes ?? null) as Record<string, unknown> | null;
-  } catch (err) {
-    logger.warn(
-      { err: (err as Error).message, mint: seed.mint, source: seed.source },
-      "[gmgn-source] deep-dive request failed — dropping candidate",
-    );
-    return { ok: false, reason: "request failed" };
+
+  // Only fetch info/security for sparse sources (signal, trenches).
+  // Trending and watchlist seeds arrive pre-enriched from /v1/market/rank —
+  // the deep-dive calls add nothing and only burn rate-limit quota.
+  const needsEnrichment = seed.source === "signal" || seed.source === "trenches";
+  if (needsEnrichment) {
+    try {
+      const [infoRes, securityRes] = await Promise.all([
+        getTokenInfo(seed.chain, seed.mint),
+        getTokenSecurity(seed.chain, seed.mint),
+      ]);
+      info = (infoRes ?? null) as Record<string, unknown> | null;
+      security = (securityRes ?? null) as Record<string, unknown> | null;
+    } catch (err) {
+      logger.warn(
+        { err: (err as Error).message, mint: seed.mint, source: seed.source },
+        "[gmgn-source] deep-dive enrichment failed — proceeding on seed data",
+      );
+    }
   }
 
   const next: GmgnSignalCandidate = { ...seed, sourceMeta: { ...seed.sourceMeta } };
@@ -1355,10 +1377,7 @@ async function deepDiveCandidate(seed: GmgnSignalCandidate): Promise<DeepDiveRes
 
   next.sourceMeta = {
     ...next.sourceMeta,
-    deepDive: {
-      info: info ?? null,
-      security: security ?? null,
-    },
+    deepDive: { info: info ?? null, security: security ?? null },
   };
 
   // Refresh score + alert so /sources-status and downstream consumers
@@ -1368,19 +1387,21 @@ async function deepDiveCandidate(seed: GmgnSignalCandidate): Promise<DeepDiveRes
   next.alert.score = next.score;
   next.alert.sourceMeta = next.sourceMeta;
 
-  // Global Jup audit gate — applied AFTER enrichment so all sources share
-  // the same fees + organicScoreLabel floor. Transient Jup failures pass.
+  // Jup audit gate — enforce fees + organicScoreLabel when Jupiter has data.
+  // When audit is null (token not indexed — too new/small), pass through and
+  // rely on GMGN-native signals. This lets new micro-caps through while still
+  // catching indexed tokens with zero organic score (e.g. bot-coordinated pumps).
   const jupCfg = getRuntimeSettings().jupGate;
   const audit = await fetchJupAudit(seed.mint);
-  const gate = passesJupGate(audit, jupCfg);
+  const effectiveCfg: JupGateConfig = audit == null
+    ? { ...jupCfg, minFees: 0, allowedScoreLabels: [] }
+    : jupCfg;
+  const gate = passesJupGate(audit, effectiveCfg);
   if (!gate.ok) {
     return { ok: false, reason: gate.reason };
   }
   if (audit) {
-    next.sourceMeta = {
-      ...next.sourceMeta,
-      jupAudit: audit,
-    };
+    next.sourceMeta = { ...next.sourceMeta, jupAudit: audit };
     next.alert.sourceMeta = next.sourceMeta;
   }
 
