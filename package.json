@@ -7,10 +7,10 @@
     "node": ">=20"
   },
   "scripts": {
-    "setup": "tsx src/_setup.ts",
-    "doctor": "tsx src/_doctor.ts",
+    "setup": "NODE_OPTIONS=--dns-result-order=ipv4first tsx src/_setup.ts",
+    "doctor": "NODE_OPTIONS=--dns-result-order=ipv4first tsx src/_doctor.ts",
     "install:onchainos": "curl -sSL https://raw.githubusercontent.com/okx/onchainos-skills/main/install.sh | sh",
-    "dev": "node --dns-result-order=ipv4first --import tsx --watch src/main.ts",
+    "dev": "NODE_OPTIONS=--dns-result-order=ipv4first tsx watch src/main.ts",
     "start": "node --dns-result-order=ipv4first --import tsx src/main.ts",
     "typecheck": "tsc --noEmit"
   },
