@@ -409,9 +409,10 @@ function minCandlesForBar(bar: string, configuredMin: number, source: TokenSampl
 }
 
 // Minimum post-signal candles for live sources (OKX/GMGN). These are current
-// tokens — 24 5m candles (~2h) is enough to simulate whether a trade exits.
-// SCG still uses MIN_CANDLES_BY_BAR (24h) since those are historical alerts.
-const LIVE_MIN_CANDLES = 24;
+// tokens, so runway is short. 6 5m candles (~30 min) is the practical floor —
+// below that there's no price action to simulate. SCG still uses MIN_CANDLES_BY_BAR
+// (24h) since those are historical alerts that have fully played out.
+const LIVE_MIN_CANDLES = 6;
 
 async function fetchSampleCandles(token: TokenSample, preferredBar: string, configuredMin: number): Promise<CandleSample | null> {
   const hasAlertTime = Boolean(token.alertTimeSec && Number.isFinite(token.alertTimeSec));
@@ -437,9 +438,9 @@ async function fetchSampleCandles(token: TokenSample, preferredBar: string, conf
     if (postSignal.length >= LIVE_MIN_CANDLES) {
       return buildCandleSample(token, postSignal, preferredBar);
     }
-    // Fall back: signal is outside the window or token is very new — use all
-    // available candles and enter at the first candle.
-    return allCandles.length >= configuredMin
+    // Fall back: signal is outside the kline window or token is very new —
+    // use all available candles and enter at first candle.
+    return allCandles.length >= LIVE_MIN_CANDLES
       ? { symbol: token.symbol, candles: allCandles, bar: preferredBar, entrySource: "first_candle" }
       : null;
   }
