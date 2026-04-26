@@ -19,6 +19,7 @@ import {
 } from "./llmMemory.js";
 
 const positions = new Map<string, Position>();
+const everBoughtMints = new Set<string>(); // permanent dedupe — never buy the same mint twice
 const BOOT_AT = Date.now();
 let realizedPnlSol = 0;
 
@@ -326,6 +327,7 @@ function markDirty(): void {
         savedAt: Date.now(),
         realizedPnlSol,
         positions: Array.from(positions.values()).map(serializePos),
+        everBoughtMints: Array.from(everBoughtMints),
       };
       await writeFile(STATE_FILE, JSON.stringify(payload, null, 2));
     } catch (err) {
@@ -347,6 +349,7 @@ async function flushPersist(): Promise<void> {
       savedAt: Date.now(),
       realizedPnlSol,
       positions: Array.from(positions.values()).map(serializePos),
+      everBoughtMints: Array.from(everBoughtMints),
     };
     await writeFile(STATE_FILE, JSON.stringify(payload, null, 2));
   } catch (err) {
@@ -372,8 +375,9 @@ async function recordStranded(record: Record<string, unknown>): Promise<void> {
 export async function loadPersistedPositions(): Promise<void> {
   try {
     const raw = await readFile(STATE_FILE, "utf8");
-    const payload = JSON.parse(raw) as { realizedPnlSol?: number; positions?: Record<string, unknown>[] };
+    const payload = JSON.parse(raw) as { realizedPnlSol?: number; positions?: Record<string, unknown>[]; everBoughtMints?: string[] };
     realizedPnlSol = payload.realizedPnlSol ?? 0;
+    for (const mint of payload.everBoughtMints ?? []) everBoughtMints.add(mint);
     const loaded = payload.positions ?? [];
     let restored = 0;
     let dropped = 0;
@@ -414,7 +418,9 @@ export async function loadPersistedPositions(): Promise<void> {
         }
       }
     }
-    logger.info({ restored, dropped, realizedPnlSol }, "[state] positions restored");
+    // Seed everBoughtMints from restored positions (handles first boot after upgrade)
+    for (const pos of positions.values()) everBoughtMints.add(pos.mint);
+    logger.info({ restored, dropped, realizedPnlSol, everBought: everBoughtMints.size }, "[state] positions restored");
   } catch (err) {
     const e = err as NodeJS.ErrnoException;
     if (e.code === "ENOENT") {
@@ -486,6 +492,13 @@ export async function openPosition(alert: ScgAlert): Promise<Position | null> {
   if (existing) {
     return existing;
   }
+
+  if (everBoughtMints.has(alert.mint)) {
+    logger.debug({ mint: alert.mint, name: alert.name }, "[open] skipped — mint already bought before");
+    return null;
+  }
+  everBoughtMints.add(alert.mint);
+  markDirty();
 
   const placeholder: Position = {
     mint: alert.mint,
