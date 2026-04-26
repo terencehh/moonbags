@@ -390,14 +390,21 @@ function candlesAfterAlert(candles: Candle[], alertTimeSec?: number): Candle[] {
   return candles.filter((c) => c.ts >= alertMs);
 }
 
-function hasRunway(candles: Candle[], alertTimeSec?: number): boolean {
+// SCG alerts are historical events that have fully played out, so we require 24h
+// of post-signal runway before accepting a sample. For live sources (OKX, GMGN)
+// the tokens are currently active — 24h future data doesn't exist yet, so we
+// skip the runway check and just require enough candles to simulate the trade.
+function hasRunway(candles: Candle[], alertTimeSec?: number, source?: TokenSample["source"]): boolean {
   if (!alertTimeSec || !Number.isFinite(alertTimeSec)) return true;
+  if (source !== "scg") return true;
   const lastTs = candles[candles.length - 1]?.ts;
   return Boolean(lastTs && lastTs - alertTimeSec * 1000 >= SCG_MIN_RUNWAY_MS);
 }
 
-function minCandlesForBar(bar: string, configuredMin: number, source: "scg" | "hot" | "gmgn" | "okx"): number {
-  if (source === "scg" || source === "gmgn" || source === "okx") return MIN_CANDLES_BY_BAR[bar] ?? configuredMin;
+// Same rationale: the 288-candle (24h) minimum is only meaningful for historical
+// SCG data. Live OKX/GMGN tokens use configuredMin (default 60 = ~5h at 5m).
+function minCandlesForBar(bar: string, configuredMin: number, source: TokenSample["source"]): number {
+  if (source === "scg") return MIN_CANDLES_BY_BAR[bar] ?? configuredMin;
   return configuredMin;
 }
 
@@ -414,14 +421,14 @@ async function fetchSampleCandles(token: TokenSample, preferredBar: string, conf
   const eagerBars = bars.slice(0, 2);
   const eager = await Promise.all(eagerBars.map(async (bar) => ({ bar, candles: candlesAfterAlert(await fetchKlines(token.address, bar), token.alertTimeSec) })));
   for (const sample of eager) {
-    if (sample.candles.length >= minCandlesForBar(sample.bar, configuredMin, token.source) && hasRunway(sample.candles, token.alertTimeSec)) {
+    if (sample.candles.length >= minCandlesForBar(sample.bar, configuredMin, token.source) && hasRunway(sample.candles, token.alertTimeSec, token.source)) {
       return buildCandleSample(token, sample.candles, sample.bar);
     }
   }
 
   for (const bar of bars.slice(2)) {
     const candles = candlesAfterAlert(await fetchKlines(token.address, bar), token.alertTimeSec);
-    if (candles.length >= minCandlesForBar(bar, configuredMin, token.source) && hasRunway(candles, token.alertTimeSec)) {
+    if (candles.length >= minCandlesForBar(bar, configuredMin, token.source) && hasRunway(candles, token.alertTimeSec, token.source)) {
       return buildCandleSample(token, candles, bar);
     }
   }
