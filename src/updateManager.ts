@@ -87,6 +87,14 @@ export async function getUpdatePreview(): Promise<UpdatePreview> {
     throw new Error("git is not installed or not on PATH. Install git before using /update.");
   }
 
+  const inGitRepo = await commandSucceeds("git", ["rev-parse", "--git-dir"], GIT_TIMEOUT_MS);
+  if (!inGitRepo) {
+    throw new Error(
+      "No .git directory found. The bot must run from a git clone for /update to work. " +
+      "On Railway: set the deploy source to a GitHub repo (not a Docker image) so the container includes .git.",
+    );
+  }
+
   await git(["fetch", REMOTE, BRANCH]);
 
   const currentSha = await git(["rev-parse", "--short", "HEAD"]);
