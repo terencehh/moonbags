@@ -972,10 +972,11 @@ async function handleCallback(cq: NonNullable<Update["callback_query"]>): Promis
 
   if (data.startsWith("backtest:run:")) {
     const [, , rawSource, rawMode] = data.split(":");
-    const source = rawSource === "okx" || rawSource === "gmgn" ? rawSource : "gmgn";
+    const source = rawSource === "okx" ? "okx" : rawSource === "combined" ? "combined" : "gmgn";
     if (rawMode === "filter") {
-      await tgPost("answerCallbackQuery", { callback_query_id: cq.id, text: `Starting ${source.toUpperCase()} filter sweep...` });
-      await handleFilterSweep(chatId, source);
+      const filterSource = source === "combined" ? "gmgn" : source;
+      await tgPost("answerCallbackQuery", { callback_query_id: cq.id, text: `Starting ${filterSource.toUpperCase()} filter sweep...` });
+      await handleFilterSweep(chatId, filterSource);
       return;
     }
     const mode = rawMode === "hybrid" ? "hybrid" : "all";
@@ -2152,16 +2153,30 @@ async function handleSetupStatus(chatId: number): Promise<void> {
 let backtestInFlight = false;
 
 async function handleBacktest(chatId: number, argText: string = ""): Promise<void> {
-  // `/backtest [source] [hybrid]` — source ∈ {scg, gmgn}, strategy ∈ {all, hybrid}
-  // [SCG-DISABLED 2026-04-22] Default source flipped from "scg" to "gmgn" now
-  // that live SCG polling is off. You can still pass `scg` explicitly to backtest
-  // against the SCG upstream (fetchScgTokens is still defined in _backtest.ts),
-  // but the default CLI path no longer hits SCG.
-  //   /backtest                  → interactive menu (buttons)
-  //   /backtest hybrid           → gmgn + hybrid
-  //   /backtest gmgn             → gmgn + all
-  //   /backtest gmgn hybrid      → gmgn + hybrid
-  //   /backtest_hybrid           → gmgn + hybrid (alias of `/backtest hybrid`)
+  // `/backtest [source] [mode]`
+  //
+  // source ∈ {gmgn, okx, combined}   — token universe to backtest against
+  //   gmgn     — GMGN trending/trenches/signal tokens only
+  //   okx      — OKX hot-tokens only (best entry-time alignment via firstTradeTime)
+  //   combined — union of GMGN + OKX universes, deduplicated by address.
+  //              Use this when the live bot runs in hybrid source mode so the
+  //              backtest reflects the same token mix the bot actually sees.
+  //
+  // mode ∈ {all, hybrid}             — exit strategy grid to sweep
+  //   all    — compares trail, fixed-TP, TP-ladder, and a small moonbag grid
+  //   hybrid — trail + moonbag only (ARM × TRAIL × STOP × MB_PCT × MB_TRAIL × MB_TIMEOUT)
+  //            "hybrid" here refers to the EXIT STRATEGY (trail + partial hold), not
+  //            the live source mode. The two uses of "hybrid" are unrelated.
+  //
+  //   /backtest                       → interactive button menu
+  //   /backtest hybrid                → gmgn + hybrid exit grid
+  //   /backtest gmgn                  → gmgn + all exit strategies
+  //   /backtest gmgn hybrid           → gmgn + hybrid exit grid
+  //   /backtest okx hybrid            → okx  + hybrid exit grid (best data quality)
+  //   /backtest combined hybrid       → gmgn+okx union + hybrid exit grid
+  //
+  // [SCG-DISABLED 2026-04-22] Default source flipped from "scg" to "gmgn".
+  // fetchScgTokens is still defined in _backtest.ts and can be restored verbatim.
   const trimmed = argText.trim();
 
   // Bare `/backtest` — show button menu so users discover variants without docs.
@@ -2201,6 +2216,10 @@ async function handleBacktest(chatId: number, argText: string = ""): Promise<voi
             { text: "🔵 OKX · hybrid", callback_data: "backtest:run:okx:hybrid" },
           ],
           [
+            { text: "🟢🔵 Combined · all", callback_data: "backtest:run:combined:all" },
+            { text: "🟢🔵 Combined · hybrid", callback_data: "backtest:run:combined:hybrid" },
+          ],
+          [
             { text: "🔬 GMGN filter sweep", callback_data: "backtest:run:gmgn:filter" },
             { text: "🔬 OKX filter sweep", callback_data: "backtest:run:okx:filter" },
           ],
@@ -2211,11 +2230,12 @@ async function handleBacktest(chatId: number, argText: string = ""): Promise<voi
   }
 
   const tokens = trimmed.toLowerCase().split(/\s+/).filter(Boolean);
-  let source: "gmgn" | "okx" = "gmgn";
+  let source: "gmgn" | "okx" | "combined" = "gmgn";
   let mode: "all" | "hybrid" = "all";
   for (const tok of tokens) {
     if (tok === "gmgn") source = "gmgn";
     else if (tok === "okx") source = "okx";
+    else if (tok === "combined" || tok === "both") source = "combined";
     else if (tok === "hybrid") mode = "hybrid";
     else if (tok === "all") mode = "all";
   }
@@ -2233,11 +2253,13 @@ async function handleBacktest(chatId: number, argText: string = ""): Promise<voi
   const llmWarning = CONFIG.LLM_EXIT_ENABLED
     ? "\n⚠️ <b>LLM exit advisor is ON.</b> LLM decisions are not candle-backtestable; this compares deterministic exits only."
     : "";
-  const sourceLabel = source === "gmgn" ? "GMGN" : "OKX";
+  const sourceLabel = source === "gmgn" ? "GMGN" : source === "okx" ? "OKX" : "GMGN+OKX";
   const fetchBlurb =
     source === "gmgn"
       ? "Fetching GMGN signals/trenches + OHLCV. Signal calls with timestamps use after-call candles; others use first-candle entry."
-      : "Fetching OKX signal-stream history via onchainos + OHLCV from each signal's timestamp with at least ~24h runway.";
+      : source === "okx"
+        ? "Fetching OKX signal-stream history via onchainos + OHLCV from each signal's timestamp with at least ~24h runway."
+        : "Fetching both GMGN and OKX token universes, deduplicating by address, then fetching OHLCV. OKX tokens use firstTradeTime entry; GMGN signal tokens use signal_time; trenches/trending use first-candle entry.";
   const startMsg = await tgPost("sendMessage", {
     chat_id: chatId,
     text:
@@ -2335,9 +2357,9 @@ async function handleBacktest(chatId: number, argText: string = ""): Promise<voi
     const entryText = Object.entries(entrySourceCounts)
       .map(([k, v]) => `${v} ${k === "alert_mcap" ? "alert mcap" : "first candle"}`)
       .join(" · ") || "none";
-    lines.push(`<i>${samplesUsed}/${tokensFetched} SCG alerts · ${allResults.length} combos · ${Math.round(durationMs/1000)}s · OHLCV from signal time · ${resolutionText} · entries ${entryText}</i>`);
+    lines.push(`<i>${samplesUsed}/${tokensFetched} alerts · ${allResults.length} combos · ${Math.round(durationMs/1000)}s · OHLCV from signal time · ${resolutionText} · entries ${entryText}</i>`);
     lines.push("");
-    lines.push("Source: SCG alert_time + alert_mcap entry when available, requiring usable post-signal OHLCV. 1m cannot cover 24h with the current 299-candle cap, so recommendations mostly use 5m/15m/1H.");
+    lines.push("Source: alert_time + alert_mcap entry when available, requiring usable post-signal OHLCV. 1m cannot cover 24h with the current 299-candle cap, so recommendations mostly use 5m/15m/1H.");
     lines.push("");
     if (CONFIG.LLM_EXIT_ENABLED) {
       lines.push("⚠️ <b>LLM is ON</b> — LLM Managed is not modeled here. Adopting a deterministic result switches the exit strategy.");

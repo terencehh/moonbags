@@ -264,6 +264,27 @@ async function fetchOkxSignals(): Promise<TokenSample[]> {
   return out;
 }
 
+async function fetchCombinedTokens(): Promise<TokenSample[]> {
+  const [gmgnResult, okxResult] = await Promise.allSettled([
+    fetchGmgnTokens(),
+    fetchOkxSignals(),
+  ]);
+  const gmgnTokens = gmgnResult.status === "fulfilled" ? gmgnResult.value : [];
+  const okxTokens  = okxResult.status  === "fulfilled" ? okxResult.value  : [];
+  if (gmgnTokens.length === 0 && okxTokens.length === 0) {
+    throw new Error("Both GMGN and OKX returned no tokens for combined backtest.");
+  }
+  const seen = new Set<string>();
+  const out: TokenSample[] = [];
+  for (const t of [...gmgnTokens, ...okxTokens]) {
+    if (!seen.has(t.address)) {
+      seen.add(t.address);
+      out.push(t);
+    }
+  }
+  return out;
+}
+
 async function fetchGmgnTokens(): Promise<TokenSample[]> {
   if (!isGmgnConfigured()) {
     throw new Error("GMGN_API_KEY is not set — cannot run GMGN backtest. Add it to .env and restart.");
@@ -629,7 +650,7 @@ export interface RunBacktestOptions {
   mbTrailRange?: number[];    // moonbag's own drawdown trail. default [0.50, 0.60, 0.70]
   mbTimeoutRange?: number[];  // moonbag max hold, minutes. default [30, 60, 120]
   onProgress?: (stage: "fetching" | "simulating", pct: number) => void;
-  source?: "scg" | "hot" | "gmgn" | "okx";
+  source?: "scg" | "hot" | "gmgn" | "okx" | "combined";
   tokenLimit?: number;
 }
 
@@ -639,7 +660,7 @@ export interface RunBacktestResult {
   allResults: GridResult[];     // full grid, sorted best→worst
   topResults: GridResult[];     // top N slice for convenience
   bar: string;
-  source: "scg" | "hot" | "gmgn" | "okx";
+  source: "scg" | "hot" | "gmgn" | "okx" | "combined";
   resolutionCounts: Record<string, number>;
   entrySourceCounts: Record<string, number>;
   durationMs: number;
@@ -675,7 +696,9 @@ export async function runBacktest(opts: RunBacktestOptions = {}): Promise<RunBac
       ? await fetchGmgnTokens()
       : source === "okx"
         ? await fetchOkxSignals()
-        : await fetchHotTokens();
+        : source === "combined"
+          ? await fetchCombinedTokens()
+          : await fetchHotTokens();
   const tokens = opts.tokenLimit && opts.tokenLimit > 0 ? fetchedTokens.slice(0, opts.tokenLimit) : fetchedTokens;
 
   // 2. Fetch klines in parallel batches
