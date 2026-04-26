@@ -1247,7 +1247,7 @@ function formatLooseCandidate(candidate: Record<string, unknown> | null): string
   const wallets = firstNumber(candidate, [["triggerWallets"], ["wallets"], ["walletCount"], ["stats", "triggerWallets"]]);
   const pieces = [
     name ? `<code>${escapeHtml(name)}</code>` : null,
-    mint ? `<code>${escapeHtml(mint.slice(0, 6))}…${escapeHtml(mint.slice(-4))}</code>` : null,
+    mint ? `<code>${escapeHtml(mint)}</code>` : null,
     score != null ? `score ${score}` : null,
     mcap != null ? `mcap ${fmtMcap(mcap)}` : null,
     liq != null ? `liq ${fmtMcap(liq)}` : null,
