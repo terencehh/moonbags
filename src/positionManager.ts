@@ -19,6 +19,7 @@ import {
 } from "./llmMemory.js";
 
 const positions = new Map<string, Position>();
+const everBoughtMints = new Set<string>(); // permanent dedupe — never buy the same mint twice
 const BOOT_AT = Date.now();
 let realizedPnlSol = 0;
 
@@ -326,6 +327,7 @@ function markDirty(): void {
         savedAt: Date.now(),
         realizedPnlSol,
         positions: Array.from(positions.values()).map(serializePos),
+        everBoughtMints: Array.from(everBoughtMints),
       };
       await writeFile(STATE_FILE, JSON.stringify(payload, null, 2));
     } catch (err) {
@@ -347,6 +349,7 @@ async function flushPersist(): Promise<void> {
       savedAt: Date.now(),
       realizedPnlSol,
       positions: Array.from(positions.values()).map(serializePos),
+      everBoughtMints: Array.from(everBoughtMints),
     };
     await writeFile(STATE_FILE, JSON.stringify(payload, null, 2));
   } catch (err) {
@@ -372,8 +375,9 @@ async function recordStranded(record: Record<string, unknown>): Promise<void> {
 export async function loadPersistedPositions(): Promise<void> {
   try {
     const raw = await readFile(STATE_FILE, "utf8");
-    const payload = JSON.parse(raw) as { realizedPnlSol?: number; positions?: Record<string, unknown>[] };
+    const payload = JSON.parse(raw) as { realizedPnlSol?: number; positions?: Record<string, unknown>[]; everBoughtMints?: string[] };
     realizedPnlSol = payload.realizedPnlSol ?? 0;
+    for (const mint of payload.everBoughtMints ?? []) everBoughtMints.add(mint);
     const loaded = payload.positions ?? [];
     let restored = 0;
     let dropped = 0;
@@ -414,7 +418,9 @@ export async function loadPersistedPositions(): Promise<void> {
         }
       }
     }
-    logger.info({ restored, dropped, realizedPnlSol }, "[state] positions restored");
+    // Seed everBoughtMints from restored positions (handles first boot after upgrade)
+    for (const pos of positions.values()) everBoughtMints.add(pos.mint);
+    logger.info({ restored, dropped, realizedPnlSol, everBought: everBoughtMints.size }, "[state] positions restored");
   } catch (err) {
     const e = err as NodeJS.ErrnoException;
     if (e.code === "ENOENT") {
@@ -485,6 +491,11 @@ export async function openPosition(alert: ScgAlert): Promise<Position | null> {
   const existing = positions.get(alert.mint);
   if (existing) {
     return existing;
+  }
+
+  if (everBoughtMints.has(alert.mint)) {
+    logger.debug({ mint: alert.mint, name: alert.name }, "[open] skipped — mint already bought before");
+    return null;
   }
 
   const placeholder: Position = {
@@ -559,6 +570,7 @@ export async function openPosition(alert: ScgAlert): Promise<Position | null> {
     },
   };
   positions.set(alert.mint, position);
+  everBoughtMints.add(alert.mint);
   await flushPersist();
   void watchOkxWsMint(alert.mint);
 
@@ -1090,7 +1102,10 @@ async function partialSellPosition(
   position.status = "open";
   position.sellFailureCount = 0;
   position.lastSellAttemptAt = undefined;
+  position.lastLlmAction = "partial_exit";
   position.lastLlmReason = reason;
+  position.lastLlmDecisionAt = Date.now();
+  position.llmDecisionCount = (position.llmDecisionCount ?? 0) + 1;
 
   // Log the partial in the position history so subsequent consults know.
   position.partialExits = position.partialExits ?? [];
@@ -1322,29 +1337,43 @@ export async function tickLlmHeartbeat(): Promise<void> {
   if (!CONFIG.LLM_EXIT_ENABLED) return;
   const heartbeatMs = CONFIG.LLM_HEARTBEAT_MINS * 60_000;
   const now = Date.now();
-  const watched = Array.from(positions.values()).filter((p) =>
-    p.status === "open" && p.llmActiveNotified && p.llmWatchStartedAt,
+  const due = Array.from(positions.values()).filter((p) =>
+    p.status === "open" &&
+    p.llmActiveNotified &&
+    p.llmWatchStartedAt &&
+    (!p.lastLlmHeartbeatAt || now - p.lastLlmHeartbeatAt >= heartbeatMs),
   );
-  for (const p of watched) {
-    if (p.lastLlmHeartbeatAt && now - p.lastLlmHeartbeatAt < heartbeatMs) continue;
+  if (due.length === 0) return;
+  for (const p of due) {
     p.lastLlmHeartbeatAt = now;
     markDirty();
+  }
+  const items = due.map((p) => {
     const entry = p.entryPricePerTokenSol;
     const current = p.currentPricePerTokenSol;
+    const peak = p.peakPricePerTokenSol;
     const pnlPct = entry > 0 ? current / entry - 1 : 0;
-    const trailFloorSol = p.armed
-      ? p.peakPricePerTokenSol * (1 - (p.dynamicTrailPct ?? CONFIG.TRAIL_PCT)) * (Number(p.tokensHeld) / 10 ** p.tokenDecimals)
-      : p.entryPricePerTokenSol * (1 - CONFIG.STOP_PCT) * (Number(p.tokensHeld) / 10 ** p.tokenDecimals);
-    const watchingMins = Math.round((now - (p.llmWatchStartedAt ?? p.openedAt)) / 60_000);
-    void notifyLlmHeartbeat({
+    const peakPnlPct = entry > 0 ? peak / entry - 1 : 0;
+    const trailPct = p.dynamicTrailPct ?? CONFIG.TRAIL_PCT;
+    const floorPnlPct = p.armed
+      ? (1 + peakPnlPct) * (1 - trailPct) - 1
+      : -CONFIG.STOP_PCT;
+    return {
       name: p.name,
       mint: p.mint,
       pnlPct,
-      trailFloorSol,
-      lastDecision: p.lastLlmReason ?? "hold",
-      watchingMins,
-    });
-  }
+      peakPnlPct,
+      trailPct,
+      floorPnlPct,
+      heldMs: now - p.openedAt,
+      lastCheckedMs: p.lastLlmCheckAt ? now - p.lastLlmCheckAt : null,
+      decisionCount: p.llmDecisionCount ?? 0,
+      lastAction: p.lastLlmAction ?? "hold",
+      lastReason: p.lastLlmReason ?? "no decision yet",
+      lastDecisionMs: p.lastLlmDecisionAt ? now - p.lastLlmDecisionAt : null,
+    };
+  });
+  void notifyLlmHeartbeat(items);
 }
 
 async function consultOnePosition(position: Position): Promise<void> {
@@ -1419,6 +1448,11 @@ async function consultOnePosition(position: Position): Promise<void> {
 
   if (decision.action === "hold") {
     logger.debug({ mint: position.mint, reason: decision.reason }, "[llm] hold");
+    position.lastLlmAction = "hold";
+    position.lastLlmReason = decision.reason;
+    position.lastLlmDecisionAt = Date.now();
+    position.llmDecisionCount = (position.llmDecisionCount ?? 0) + 1;
+    markDirty();
     return;
   }
 
@@ -1431,7 +1465,10 @@ async function consultOnePosition(position: Position): Promise<void> {
     }
     const direction = decision.newTrailPct < oldTrail ? "tightened" : "loosened";
     position.dynamicTrailPct = decision.newTrailPct;
+    position.lastLlmAction = "set_trail";
     position.lastLlmReason = decision.reason;
+    position.lastLlmDecisionAt = Date.now();
+    position.llmDecisionCount = (position.llmDecisionCount ?? 0) + 1;
     markDirty();
     logger.info(
       { mint: position.mint, oldTrail, newTrail: decision.newTrailPct, direction, reason: decision.reason },
@@ -1452,7 +1489,10 @@ async function consultOnePosition(position: Position): Promise<void> {
 
   if (decision.action === "exit_now") {
     logger.info({ mint: position.mint, reason: decision.reason }, "[llm] exit triggered");
+    position.lastLlmAction = "exit_now";
     position.lastLlmReason = decision.reason;
+    position.lastLlmDecisionAt = Date.now();
+    position.llmDecisionCount = (position.llmDecisionCount ?? 0) + 1;
     markDirty();
     await closePosition(position.mint, "llm");
     return;

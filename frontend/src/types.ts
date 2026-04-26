@@ -11,8 +11,20 @@ export type Position = {
   armed: boolean;
   openedAt: number;
   tokensHeld: string;
+  originalTokensHeld?: string;
   tokenDecimals: number;
   exitReason?: string;
+  moonbagMode?: boolean;
+  partialExits?: Array<{
+    at: number;
+    sellPct: number;
+    entrySol?: number;
+    exitSol: number;
+    pnlSol?: number;
+    priceSol: number;
+    reason: string;
+    sig?: string;
+  }>;
 };
 
 export type Alert = {

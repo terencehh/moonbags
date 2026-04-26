@@ -4,7 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CONFIG } from "./config.js";
 import logger from "./logger.js";
-import { getPositions, getStats, getClosedTrades, getSignalStats, type SignalStats } from "./positionManager.js";
+import { forceClosePosition, getPositions, getStats, getClosedTrades, getSignalStats, type SignalStats } from "./positionManager.js";
 import { getRecentAlertEvents } from "./scgPoller.js";
 import { getTokenInfos } from "./jupTokensClient.js";
 import { getKline } from "./okxClient.js";
@@ -245,24 +245,45 @@ export function startServer(): () => void {
   const server = http.createServer((req, res) => {
     const url = req.url ?? "/";
     const method = req.method ?? "GET";
+    const pathname = url.split("?")[0] ?? "/";
+    const manualSellMatch = pathname.match(/^\/api\/positions\/([^/]+)\/sell$/);
 
     if (method === "OPTIONS") {
       res.writeHead(204, {
         "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET, OPTIONS",
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
         "Access-Control-Allow-Headers": "Content-Type",
       });
       res.end();
       return;
     }
 
-    if (method !== "GET") {
-      res.writeHead(405);
-      res.end("method not allowed");
+    if (method === "POST" && manualSellMatch) {
+      const mint = decodeURIComponent(manualSellMatch[1] ?? "");
+      const existing = getPositions().find((position) => position.mint === mint);
+      if (!existing) {
+        sendJson(res, 404, { ok: false, reason: "not found" });
+        return;
+      }
+      forceClosePosition(mint)
+        .then((result) => {
+          if (!result.ok) {
+            sendJson(res, 409, result);
+            return;
+          }
+          sendJson(res, 202, result);
+        })
+        .catch((err) => {
+          logger.error({ err: String(err), mint }, "[server] manual sell failed");
+          sendJson(res, 500, { ok: false, reason: "internal" });
+        });
       return;
     }
 
-    const pathname = url.split("?")[0] ?? "/";
+    if (method !== "GET") {
+      sendJson(res, 405, { error: "method not allowed" });
+      return;
+    }
 
     if (pathname === "/health") {
       sendJson(res, 200, { ok: true });

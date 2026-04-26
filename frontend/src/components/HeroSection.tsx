@@ -91,32 +91,33 @@ export function HeroSection({ state }: Props) {
           </div>
         </div>
 
-        <div className="relative min-h-[180px] overflow-hidden rounded-xl border border-outline-variant/20 bg-background/20 px-4 py-5">
+        <div className="relative min-h-[220px] overflow-hidden rounded-xl border border-outline-variant/20 bg-background/20 px-4 py-4">
           <div className="absolute inset-y-0 left-0 right-0 bg-[linear-gradient(to_bottom,transparent,rgba(12,14,18,0.16)_76%,rgba(12,14,18,0.48))]" aria-hidden="true" />
-          <div className="absolute right-4 top-4 z-20 flex items-center gap-2 rounded-lg border border-outline-variant/20 bg-background/70 p-1 backdrop-blur">
-            <WindowButton
-              label="24H"
-              active={windowMode === "24h"}
-              onClick={() => setWindowMode("24h")}
-            />
-            <WindowButton
-              label="All"
-              active={windowMode === "all"}
-              onClick={() => setWindowMode("all")}
-            />
+          <div className="relative z-20 flex flex-wrap items-center justify-between gap-3">
+            <div className="rounded-md border border-outline-variant/15 bg-background/55 px-3 py-1.5 font-mono text-[10px] uppercase text-muted-foreground backdrop-blur">
+              Window
+              <span className="ml-2 text-foreground">{windowMode === "24h" ? "24H" : "ALL"}</span>
+            </div>
+            <div className="flex items-center gap-2 rounded-lg border border-outline-variant/20 bg-background/70 p-1 backdrop-blur">
+              <WindowButton
+                label="24H"
+                active={windowMode === "24h"}
+                onClick={() => setWindowMode("24h")}
+              />
+              <WindowButton
+                label="All"
+                active={windowMode === "all"}
+                onClick={() => setWindowMode("all")}
+              />
+            </div>
           </div>
-          <div className="absolute left-4 top-4 z-20 rounded-md border border-outline-variant/15 bg-background/55 px-3 py-1.5 font-mono text-[10px] uppercase tracking-[0.2em] text-muted-foreground backdrop-blur">
-            Window
-            <span className="ml-2 text-foreground">{windowMode === "24h" ? "24H" : "ALL"}</span>
-          </div>
-          <div className="relative h-full">
+          <div className="relative z-10 mt-4 h-[140px] md:h-[154px]">
             <Liveline
               data={chartPoints}
               value={currentChartValue}
               theme="dark"
               color="#86c43d"
               window={effectiveWindow}
-              windowStyle="text"
               grid={false}
               badge={false}
               fill
@@ -127,6 +128,7 @@ export function HeroSection({ state }: Props) {
               emptyText={chartEmptyText}
               formatValue={(value) => `${value >= 0 ? "+" : ""}${value.toFixed(2)} SOL`}
               formatTime={(time) => new Date(time * 1000).toLocaleString()}
+              padding={{ top: 12, right: 12, bottom: 24, left: 10 }}
               className="h-full w-full"
             />
           </div>
@@ -166,7 +168,7 @@ function WindowButton({
       type="button"
       onClick={onClick}
       aria-pressed={active}
-      className={`rounded-md px-3 py-1.5 font-mono text-[10px] uppercase tracking-[0.2em] transition-colors ${
+      className={`rounded-md px-3 py-1.5 font-mono text-[10px] uppercase transition-colors ${
         active
           ? "bg-pepe/18 text-pepe border border-pepe/30 shadow-[0_0_0_1px_rgba(134,196,61,0.12)_inset]"
           : "text-muted-foreground border border-transparent hover:text-foreground hover:bg-background/60"

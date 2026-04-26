@@ -33,3 +33,11 @@ export const fmtUsd = (n: number) => {
   if (n >= 1_000) return `$${(n / 1_000).toFixed(2)}K`;
   return `$${n.toFixed(2)}`;
 };
+
+export const fmtCompactSol = (n: number) => {
+  if (n >= 100) return `${n.toFixed(0)} SOL`;
+  if (n >= 10) return `${n.toFixed(1)} SOL`;
+  if (n >= 1) return `${n.toFixed(2)} SOL`;
+  if (n >= 0.1) return `${n.toFixed(3)} SOL`;
+  return `${n.toFixed(4)} SOL`;
+};
