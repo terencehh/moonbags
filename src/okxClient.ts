@@ -265,7 +265,7 @@ export type Candle = {
 // ---------------------------------------------------------------------------
 export async function getPriceMomentum(mint: string): Promise<PriceMomentum | null> {
   const key = `momentum:${mint}`;
-  const hit = cacheGet<PriceMomentum>(key, 5_000);
+  const hit = cacheGet<PriceMomentum>(key, 25_000);
   if (hit) return hit;
 
   type Raw = {
@@ -318,7 +318,7 @@ async function getTradesByTag(
   limit = 200,
 ): Promise<TradeWindow> {
   const key = `trades:${mint}:${tagFilter}:${limit}`;
-  let raw = cacheGet<unknown[]>(key, 10_000);
+  let raw = cacheGet<unknown[]>(key, 25_000);
   if (!raw) {
     const data = await runCli<unknown[]>([
       "token", "trades",

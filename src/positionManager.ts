@@ -1308,9 +1308,14 @@ export async function tickLlmAdvisor(): Promise<void> {
 
   if (candidates.length === 0) return;
 
-  await Promise.all(candidates.map((p) => consultOnePosition(p).catch((err) => {
-    logger.error({ err: String(err), mint: p.mint }, "[llm] advisor tick failed");
-  })));
+  // Process positions sequentially to avoid N×12 concurrent onchainos calls that
+  // trigger rate limiting. Each position still fetches its 12 snapshot calls in
+  // parallel internally via getPositionSnapshot; serializing here caps the burst.
+  for (const p of candidates) {
+    await consultOnePosition(p).catch((err) => {
+      logger.error({ err: String(err), mint: p.mint }, "[llm] advisor tick failed");
+    });
+  }
 }
 
 export async function tickLlmHeartbeat(): Promise<void> {
