@@ -408,8 +408,17 @@ function minCandlesForBar(bar: string, configuredMin: number, source: TokenSampl
   return configuredMin;
 }
 
+// Minimum post-signal candles for live sources (OKX/GMGN). These are current
+// tokens — 24 5m candles (~2h) is enough to simulate whether a trade exits.
+// SCG still uses MIN_CANDLES_BY_BAR (24h) since those are historical alerts.
+const LIVE_MIN_CANDLES = 24;
+
 async function fetchSampleCandles(token: TokenSample, preferredBar: string, configuredMin: number): Promise<CandleSample | null> {
   const hasAlertTime = Boolean(token.alertTimeSec && Number.isFinite(token.alertTimeSec));
+
+  // ── Non-SCG, no signal time ────────────────────────────────────────��─────
+  // Enter at first available candle; require configuredMin (60) so there's
+  // enough history to see exit triggers.
   if (token.source !== "scg" && !hasAlertTime) {
     const candles = await fetchKlines(token.address, preferredBar);
     return candles.length >= configuredMin
@@ -417,6 +426,25 @@ async function fetchSampleCandles(token: TokenSample, preferredBar: string, conf
       : null;
   }
 
+  // ── Non-SCG, has signal time ─────────────────────────────────────────────
+  // These are live OKX/GMGN tokens. The signal time is recent, so post-signal
+  // candle counts are small. Use LIVE_MIN_CANDLES (24) instead of configuredMin.
+  // If the signal falls outside the kline window (too old) or there aren't
+  // enough post-signal candles, fall back to first-candle with the full set.
+  if (token.source !== "scg") {
+    const allCandles = await fetchKlines(token.address, preferredBar);
+    const postSignal = candlesAfterAlert(allCandles, token.alertTimeSec);
+    if (postSignal.length >= LIVE_MIN_CANDLES) {
+      return buildCandleSample(token, postSignal, preferredBar);
+    }
+    // Fall back: signal is outside the window or token is very new — use all
+    // available candles and enter at the first candle.
+    return allCandles.length >= configuredMin
+      ? { symbol: token.symbol, candles: allCandles, bar: preferredBar, entrySource: "first_candle" }
+      : null;
+  }
+
+  // ── SCG: strict bar-priority with 24h runway ─────────────────────────────
   const bars = Array.from(new Set([preferredBar, ...SCG_BAR_PRIORITY]));
   const eagerBars = bars.slice(0, 2);
   const eager = await Promise.all(eagerBars.map(async (bar) => ({ bar, candles: candlesAfterAlert(await fetchKlines(token.address, bar), token.alertTimeSec) })));
